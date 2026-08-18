@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+# MOSS-Realtime backend (server/) — pure ORCHESTRATION. No manual sidecar step:
+# the backend spawns, health-gates and terminates its own TTS/sglang sidecars in
+# the FastAPI lifespan (server/sidecars.py, server/gpu/supervisor.py) — this one
+# script IS the whole voice stack.
+#
+# Config comes in four layers (see server/config.py docstring): command env >
+# the layer-2 block below > .env.deploy > config.py defaults. Every model pin
+# and serving knob that used to live here is a config.py default now.
+set -euo pipefail
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+
+# ---- startup-script overrides (config layer 2) ----
+# Explicit deploy pins for THIS entrypoint: they yield to command env but beat
+# .env.deploy (they run before load_env_deploy). Idiom — never plain `export
+# VAR=value` (that would clobber the command line):
+#   : "${GEN_MAX_TOKENS_PER_TURN:=20}"; export GEN_MAX_TOKENS_PER_TURN
+# (currently empty — defaults live in server/config.py)
+
+# ---- .env.deploy (config layer 3; box-local, gitignored) ----
+. "$REPO/scripts/deploy/env_lib.sh"
+load_env_deploy "$REPO"
+
+# torchcodec dlopens the FFmpeg shared libs (libavutil & co), which fresh pods
+# don't ship (apt state dies with the container). They are vendored INSIDE the
+# venv on the shared FS (.venv/lib/ffmpeg — the .so closure of a conda-forge
+# "ffmpeg=6.1" env), so they survive pod restarts with everything else. To
+# rebuild: conda create -p /tmp/ffenv -c conda-forge ffmpeg=6.1 && cp -a
+# /tmp/ffenv/lib/*.so* "$REPO/.venv/lib/ffmpeg/".
+FFMPEG_LIBS="${FFMPEG_LIBS:-$REPO/.venv/lib/ffmpeg}"
+if [ -d "$FFMPEG_LIBS" ]; then
+  export LD_LIBRARY_PATH="$FFMPEG_LIBS${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+elif ! ldconfig -p 2>/dev/null | grep -q libavutil; then
+  echo "WARNING: no FFmpeg libs found (system or $FFMPEG_LIBS) — VLM autoload will fail on torchcodec" >&2
+fi
+
+# gateway python log: rotating file under the in-repo logs/handler/ tree
+# (shared FS — survives pod restarts, readable from the CPU box);
+# logging_conf.py adds a RotatingFileHandler next to stdout when this is set,
+# and routes uvicorn's access/error lines through it too. Workers rotate under
+# logs/handler/backend/workers/, TTS engines under logs/handler/sidecar/
+# (config.py defaults). This script is the ONE place that defaults
+# MOSS_LOG_FILE — unset (tests, ad-hoc runs) stays stdout-only.
+export MOSS_LOG_FILE="${MOSS_LOG_FILE:-$REPO/logs/handler/backend/backend.log}"
+# stdout feeds a pipe (demo.sh rotating tee), not a tty — keep it line-live;
+# children (workers, sidecars) inherit this too
+export PYTHONUNBUFFERED=1
+
+cd "$REPO"
+# uvloop (ships with uvicorn[standard]) keeps the WS plane snappy under load
+exec .venv/bin/python -m uvicorn server.app:app --host 127.0.0.1 --port "${PORT:-8000}" \
+  --loop "${UVICORN_LOOP:-uvloop}"

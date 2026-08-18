@@ -1,0 +1,224 @@
+# `server/` — MOSS-Realtime backend
+
+FastAPI gateway for the streaming video-understanding demo. Ports the MOSS-VL
+realtime loop from the reference board backend; ASR/TTS/VLM sit behind pluggable
+adapters. **Frontend serving is intentionally not wired yet** — this exposes the API
+only.
+
+## Architecture (after the overhaul)
+
+One **server-orchestrated session** replaces the browser-stitched 3-socket design:
+
+```
+POST /api/sessions  ──▶  SessionManager ──▶ Orchestrator (async task per session)
+                                     VAD/PTT → ASR → MOSS-VL realtime → TTS
+WS /api/session/{sid}/ws  ◀── captions (response.text.delta) · TTS PCM (binary 0x11)
+   mic PCM (0x01) · JPEG (0x02) · JSON control ──▶
+```
+
+- Wire protocol: `server/protocol.py` (frozen).
+- The orchestrator owns barge-in (soft VLM interrupt that keeps the KV cache),
+  control-token mapping, and the TTS back-pressure/drop-stale policy
+  (`asr-tts_research.md` §1C hooks: `audio_queue_seconds` / `should_emit_next_unit`
+  / `drop_stale`). Board-parity turn lifecycle: `<|silence|>` is the model's
+  end-of-round signal — it finalizes the open response (one transcript bubble
+  per round; the token itself is never surfaced) — and frames stream to the
+  model continuously even mid-generation (backpressure = the frame queue's
+  drop-oldest-pure-frame policy only).
+- Reconnect: `?last_seq=N` replays missed events from a per-session ring buffer;
+  a dropped socket keeps the session alive for `SESSION_GRACE_SECONDS` (45 s).
+- The legacy 3-channel routers (`voice_ws`/`realtime_ws`) are **removed** — the
+  frontend speaks the session plane (overhaul §5 step 4 complete).
+
+## Run
+
+```bash
+cd <repo>            # MOSS-VL-Realtime_Demo_App
+# Models default to the repo-local, gitignored models/ zoo (grouped by kind):
+#   models/asr/{SenseVoiceSmall,fsmn-vad}
+#   models/tts/MOSS-TTS-Nano-100M
+#   models/vlms/{hf_mossvl_streaming_processor (online), offline}
+# Populate models/ (or point MODELS_DIR at a zoo laid out the same way), then boot:
+GPU_ID=0 AUTOLOAD_VLM=1 \
+.venv/bin/python -m uvicorn server.app:app --host 0.0.0.0 --port 8000
+# Override the online checkpoint explicitly with MODEL_PATH=… if it lives elsewhere.
+```
+
+Without `AUTOLOAD_VLM=1` the app boots with no model; load one later via
+`POST /api/models/load {model_path, gpu_id, hf_mode}` (legacy alias
+`/api/load_model`; refused with 409 while sessions are live).
+
+The TTS engine runs as a separate **sidecar/engine** on `http://127.0.0.1:18100+`
+(spawned + health-gated by the backend lifespan), or set `TTS_ENABLED=0`
+(sessions then stream captions without audio). `TTS_PROVIDER` picks the model
+(per-model adapters under `server/adapters/tts/`): `moss_tts_nano` (pytorch
+sidecar) · `vllm_omni` (Nano on vLLM-Omni) · `cosyvoice3` /
+`moss_tts_realtime` (Fun-CosyVoice3-0.5B / MOSS-TTS-Realtime on vLLM-Omni,
+24 kHz mono) · `cosyvoice3_native` / `moss_tts_realtime_native` (vendored
+fallback stacks in `.venv-cosy` / `.venv-mossrt`).
+
+## Online vs offline serving (two models, split GPU fleet)
+
+Two checkpoints serve two surfaces (paths default in `config.py`, under the
+grouped `models/vlms/` zoo):
+
+- **ONLINE** (`MODEL_PATH`, default `models/vlms/hf_mossvl_streaming_processor` —
+  the streaming HF bundle, weights + processor): realtime streaming sessions on
+  the replica-per-GPU HF worker fleet (`adapters/vlm/moss_vl_hf/online_pool.py`).
+- **OFFLINE** (`OFFLINE_MODEL_PATH`, default `models/vlms/offline`): the chat page
+  (`POST/WS /api/chat/stream`) on dedicated `sglang.launch_server` sidecars
+  (`adapters/vlm/moss_vl_sglang/adapter.py`, ports 30800+) — the fnlp-vision sglang
+  fork from `.venv-sglang` (`scripts/build_venv_sglang.sh`; stock sglang cannot
+  serve `moss_vl`).
+
+`gpu/placement.py` carves the eligible GPUs ≈1:3 offline:online (8→2+6,
+4→1+3, 2→1+1, 1→online only; `OFFLINE_GPU_RATIO`/`OFFLINE_GPU_COUNT`), giving
+offline the highest indices; ASR/TTS colocate with online workers only. When
+the plane is absent or down (no `.venv-sglang`, sidecar crash, 1-GPU box),
+`routers/chat.py` falls back to the online pool — pre-split behavior —
+and `/api/status` shows `vlm_offline.loaded: false`.
+
+## Tests
+
+```bash
+V=.venv/bin/python
+$V -m server.tests.test_protocol         # B1 wire-format round-trips
+$V -m server.tests.test_session_manager  # B2 lifecycle + grace GC + supersede
+$V -m server.tests.smoke_orchestrator    # B3 scripted turns, barge-in, §1C hooks
+$V -m server.tests.test_session_ws       # B4/B5/B7 live uvicorn + websockets client
+$V -m server.tests.test_asr_partials     # SenseVoice partial-decode worker (stub engine)
+$V -m server.tests.test_persistence      # journal+index recording, CAS, delete, rebuild
+$V -m server.tests.smoke_media           # upload/dedup/reject + ETag/Range + history HTTP
+$V -m server.tests.test_gpu_planning     # topology, attn select, online/offline GPU split
+$V -m server.tests.test_vlm_online_pool  # online replica pool state machine
+$V -m server.tests.test_tts_providers    # TTS provider registry/sizing/wire protocols
+$V -m server.tests.test_offline_sglang   # sglang adapter: SSE deltas, media prep, failover
+$V -m server.tests.test_vlm_workers      # gateway + 4 fake worker processes E2E
+ASR_ENABLED=0 TTS_ENABLED=0 AUTOLOAD_VLM=0 $V -m server.tests.smoke_import
+```
+
+All of the above run **without a GPU** (fake engines). Against a live backend
+(real model on Box 2):
+
+```bash
+$V scripts/e2e_session.py --text "画面里是什么？" --frames 3         # typed turn
+$V scripts/e2e_session.py --wav question_16k.wav --frames 3        # voice turn
+# prints captions + asr/ttft/ttfa latencies, saves the reply to e2e_reply.wav
+```
+
+## Endpoints
+
+| surface | path | purpose |
+|---|---|---|
+| HTTP| `POST /api/sessions` · `GET/DELETE /api/sessions/{sid}` | session lifecycle (409 = model occupied) |
+| WS  | `/api/session/{sid}/ws?last_seq=N` | **the** realtime socket: mic/video/control in, captions/PCM/events out |
+| HTTP| `POST /api/models/load` | load/replace the VLM (409 while sessions live) |
+| WS/SSE | `/api/chat/stream` | offline multimodal chat (separate from realtime by design); **multi-turn**: `messages` carries the whole conversation, with per-turn images as `{"type":"image","media":"sha256:…"}` parts (data-URLs also accepted) and per-turn videos as `{"type":"video","media":"sha256:…"}` parts (CAS handles ONLY — the adapter resolves the blob path and torchcodec samples frames, fps/min/max_frames tunable via `params`); legacy top-level `images`/`videos` still attach to the last user turn; `conversation_id` opts the turn pair into history |
+| HTTP| `POST /api/media` · `GET /api/media/{hash}[/info\|/thumb]` | CAS upload (multipart image/video) + immutable serving (ETag, Range/206); `/info` = descriptor probe so a client that hashed its video locally can skip a duplicate transfer (404 = upload it) |
+| HTTP| `POST /api/asr` (raw PCM16 mono 16 kHz) · `POST /api/tts` ({text, voice?} → WAV) | one-shot speech for the CHAT page: rolling dictation + bubble read-aloud (the realtime plane keeps its own ASR/TTS on the session socket) |
+| HTTP| `GET/DELETE /api/history[/{cid}]` (`?q=` = FTS search, `?kind=chat\|realtime` = facet) | recorded conversations: sidebar list, transcript, delete |
+| HTTP| `/api/status` (incl. voice + live sessions) · `/api/health` | ops |
+
+Wire-message details: `server/protocol.py` docstring.
+
+## Config (env)
+
+Config resolves in **four layers**, highest priority first (the docker-compose
+CLI > environment > env_file > image-ENV model; full contract in the
+`server/config.py` docstring):
+
+1. **command env** — `MODEL_PATH=x demo.sh up` or `demo.sh up MODEL_PATH=x`
+   (trailing `KEY=VALUE` args; args beat the prefix)
+2. **startup-script pins** — the marked layer-2 blocks in
+   `scripts/deploy/run_*.sh` (`: "${VAR:=value}"; export VAR` idiom)
+3. **`.env.deploy`** — plain KEY=VALUE at the repo root (gitignored; complete
+   generated reference in `.env.deploy.example`). Applied with *setdefault*
+   semantics by both `get_settings()` and `scripts/deploy/env_lib.sh` — a set
+   env var always wins. `ENV_DEPLOY_FILE` overrides the path; empty disables
+   (tests pin it empty via `server/tests/__init__.py`).
+4. **code defaults** — `server/config.py` (the single source of defaults;
+   deploy scripts are orchestration-only)
+
+After adding/renaming a setting run `scripts/dev/check_env.py --write` — it
+regenerates `.env.deploy.example` and `scripts/deploy/env_manifest.sh` (the
+vars demo.sh forwards into its tmux windows); `--check` lints drift and is
+covered by `server/tests/test_config_layering.py` territory.
+
+All knobs live in `server/config.py`. Key ones: `MODEL_PATH`, `GPU_ID`, `HF_MODE`,
+`MOSSVL_STREAMING_PROCESSOR_PATH`, `ATTN_IMPL` (+`ATTN_IMPL_FALLBACK=sdpa`),
+`ASR_PROVIDER`/`ASR_DEVICE`/`ASR_FP16`, `TTS_PROVIDER`/`MOSS_TTS_NANO_BASE_URL`,
+`CAPTURE_MODE` (`ptt`|`auto`), `VOICE_ASR_AUTO_*` thresholds.
+`ASR_PARTIAL_INTERVAL_MS` (default 800, 0 = off) drives realtime captions:
+SenseVoice has no native streaming, so the stream re-decodes its buffer every
+interval and emits `input.transcription.delta` through the standard
+`on_partial` adapter hook — a genuinely streaming engine later is a pure
+adapter swap.
+
+Session-plane knobs: `SESSION_GRACE_SECONDS`, `SESSION_REPLAY_BUFFER`,
+`STATUS_INTERVAL_S`, `FRAME_MAX_AGE_S`; TTS pacing policy:
+`AUDIO_BUFFER_HIGH_S`/`AUDIO_BUFFER_LOW_S`, `TTS_MAX_PENDING_UNITS`,
+`TTS_UNIT_MAX_AGE_S`, `TTS_FIRST_CLAUSE_CHARS`, `TTS_SEGMENT_MIN/SOFT/MAX_CHARS`
+(now 12/75/150 per `asr-tts_research.md` §1A T4).
+
+Persistence knobs: `HISTORY_ENABLED`/`MEDIA_ENABLED` (both default 1), `DATA_DIR`
+(default `<repo>/data` — the shared FS survives pod restarts; /tmp does not),
+`HISTORY_DB_PATH`, `UPLOAD_MAX_BYTES` (512 MB), `MEDIA_MIME_ALLOW`,
+`MEDIA_THUMB_MAX_EDGE`, `HISTORY_KEEP_FRAMES` (0 — camera frames are never stored).
+
+## History + media store (`server/persistence/`)
+
+Two durable archives under `DATA_DIR` — nothing auto-evicts:
+
+- **History**: append-only JSONL journal (`journal/YYYY/MM/<cid>.jsonl`, the source
+  of truth) + a derived SQLite index (`index.db`: conversations/turns/FTS5-trigram).
+  Realtime sessions record automatically (the recorder taps `SessionState.emit`;
+  turn-level events only — text deltas and PCM are never journaled). Chat threads
+  record when the client sends a `conversation_id`. Live (`kind=realtime`) and
+  offline (`kind=chat`) histories are separate lists (`GET /api/history?kind=`);
+  live replays are read-only by design. File-streaming sessions additionally
+  record the source video: the client uploads it to the CAS and sends
+  `video.attach {media}` on the session WS (→ journaled `input.video.attached`,
+  a media-only turn), and every turn carries `media_ts` — the video position it
+  happened at — in its metrics, so the replay UI can seek the stored video. The
+  session's `video_source` config field (`camera`/`file`) tags the sidebar entry.
+- **Media**: content-addressed blobs (`media/blobs/sha256/ab/cd/<hash>`) for uploads —
+  dedup for free, immutable HTTP caching. Ingest is hardened per OWASP: magic-byte
+  sniffing (client MIME is never trusted), MIME allowlist, streaming size cap, and
+  images are **re-encoded** (EXIF/GPS/polyglot strip) before hashing. Video metadata
+  and poster frames come from torchcodec (needs the FFmpeg libs on
+  `LD_LIBRARY_PATH`, see `run_backend.sh`; degrades gracefully without).
+
+Writes never touch the event loop: one daemon writer thread owns the SQLite write
+connection + journal appends (producers only enqueue); media ingest runs via
+`asyncio.to_thread`. Maintenance (backend stopped):
+
+```bash
+.venv/bin/python scripts/history_prune.py --unreferenced [--older-than 30]  # GC unref'd blobs
+.venv/bin/python scripts/history_prune.py --drop-conversations --older-than 90
+.venv/bin/python scripts/history_prune.py --rebuild   # index.db from journals + blob scan
+```
+
+## Layout
+
+```
+app.py · config.py · deps.py · schemas.py · protocol.py · logging_conf.py
+session/     state · manager · orchestrator      ← the overhaul (§B1–B7)
+persistence/ store · recorder · media · ingest   ← history journal+index, CAS media
+routers/     sessions · session_ws · chat · history · media · ops
+adapters/    base · registry · asr/ · tts/ · vlm/ (per-model subdirs)
+realtime/    session · mossvl_patches
+voice/       segmenter · tts_session · vad
+tests/       test_protocol · test_session_manager · smoke_orchestrator ·
+             test_session_ws · test_asr_partials · test_persistence · smoke_media · smoke_import ·
+             smoke_asr · smoke_realtime · test_tts_providers · fakes
+```
+
+## Frontend counterpart
+
+`src/lib/{sessionSocket,micWorklet,frameSampler,pcmPlayer}.ts` +
+`src/hooks/useSession.ts` + `public/worklets/pcm-worklet.js` implement the
+client half (overhaul §F1–F5); `src/App.tsx` binds them (§F6). Vite proxies
+`/api` (HTTP + WS) to `:8000` on both `dev` and `preview`, so the one gateway
+forward link `…/proxy/5173/` serves page and backend together (§8 decision 1).
+Restart `npm run preview` after pulling this change — the proxy config loads
+at server start.
