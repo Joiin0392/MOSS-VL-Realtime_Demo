@@ -37,6 +37,7 @@ from .logging_conf import (
     LOG_FORMAT,
     get_logger,
 )
+from .device_compat import set_visible_device
 
 log = get_logger(__name__)
 
@@ -44,10 +45,10 @@ _ROTATING_TEE = os.path.join(REPO_ROOT, "scripts", "deploy", "rotating_tee.py")
 
 
 def _target_compute_cap(gpu_index: Optional[int]) -> Optional[Tuple[int, int]]:
-    """Compute capability of the GPU this sidecar will run on, via the nvidia-smi
-    topology probe (a subprocess — never initializes CUDA in the gateway). None
-    when undetectable. gpu_index None = the sidecar inherits the gateway's CUDA
-    visibility, so GPU 0 is the representative card (a box is single-SKU)."""
+    """Compute capability of the GPU/NPU this sidecar will run on, via the smi
+    topology probe (a subprocess — never initializes CUDA/NPU in the gateway). None
+    when undetectable. gpu_index None = the sidecar inherits the gateway's device
+    visibility, so device 0 is the representative card (a box is single-SKU)."""
     try:
         from .gpu.topology import probe_topology
         gpus = probe_topology(timeout_s=5.0)
@@ -354,9 +355,9 @@ def spawn_tts_sidecar(settings: Settings, base_url: Optional[str] = None,
         env.setdefault("MOSS_TTS_NANO_CHECKPOINT", settings.tts_vllm_model)
         env.setdefault("MOSS_TTS_NANO_AUDIO_TOKENIZER", settings.tts_vllm_codec)
     if gpu_index is not None:
-        env["CUDA_VISIBLE_DEVICES"] = str(gpu_index)
+        set_visible_device(env, gpu_index)
     elif settings.tts_sidecar_gpu:
-        env["CUDA_VISIBLE_DEVICES"] = settings.tts_sidecar_gpu
+        set_visible_device(env, int(settings.tts_sidecar_gpu))
     log.info("Spawning TTS sidecar: %s (cwd=%s, log=%s)", " ".join(cmd), cwd, log_path)
     if is_vllm:
         # everything python-level goes through the engine's own rotating log

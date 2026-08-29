@@ -108,9 +108,14 @@ prep_logs() {
 
 gpu_preflight() {
   [ -n "${DEMO_SKIP_GPU:-}" ] && { echo "[preflight] skipped (DEMO_SKIP_GPU)"; return; }
+  # Accept either nvidia-smi (GPU) or npu-smi (Ascend NPU)
+  if command -v npu-smi >/dev/null 2>&1; then
+    echo "[preflight] NPU detected (npu-smi) — skipping nvidia-smi check."
+    return
+  fi
   if ! command -v nvidia-smi >/dev/null; then
-    echo "No nvidia-smi on this box — no GPU here. Run on the GPU box, or"
-    echo "DEMO_SKIP_GPU=1 for a frontend/CPU-only bring-up (VLM will not load)."
+    echo "No nvidia-smi or npu-smi on this box — no accelerator here. Run on the"
+    echo "GPU/NPU box, or DEMO_SKIP_GPU=1 for a frontend/CPU-only bring-up."
     exit 1
   fi
   echo "[preflight] GPU driver sanity (nvidia-smi, 10s budget) ..."

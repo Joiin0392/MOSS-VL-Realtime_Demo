@@ -33,6 +33,7 @@ from typing import Any, Awaitable, Callable, Deque, Dict, Optional, Tuple
 from .. import protocol as p
 from ..config import Settings
 from ..logging_conf import get_logger
+from ..device_compat import is_available, current_device, memory_allocated, memory_reserved
 from ..memory import inject as mem_inject
 from ..memory import session as mem_session
 from ..persistence.media import normalize_hash
@@ -1294,13 +1295,15 @@ def _gpu_snapshot() -> Optional[Dict[str, Any]]:
     global _gpu_warned
     try:
         torch = sys.modules.get("torch")
-        if torch is None or not torch.cuda.is_available():
+        if torch is None:
             return None
-        idx = torch.cuda.current_device()
+        if not is_available():
+            return None
+        idx = current_device()
         return {
             "device": idx,
-            "mem_allocated_gb": round(torch.cuda.memory_allocated(idx) / 2**30, 2),
-            "mem_reserved_gb": round(torch.cuda.memory_reserved(idx) / 2**30, 2),
+            "mem_allocated_gb": round(memory_allocated(idx) / 2**30, 2),
+            "mem_reserved_gb": round(memory_reserved(idx) / 2**30, 2),
         }
     except Exception as exc:  # noqa: BLE001
         if not _gpu_warned:
