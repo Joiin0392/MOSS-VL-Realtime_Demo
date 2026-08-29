@@ -431,10 +431,12 @@ export function useSession(callbacks: UseSessionCallbacks) {
         socketRef.current = socket;
         socket.connect();
 
-        if (stream && stream.getAudioTracks().length > 0) {
-          micRef.current = await startMicCapture(stream, (pcm) => socketRef.current?.sendMic(pcm));
-          updateMicGate();
-        }
+        // Sampler must exist BEFORE the first await: session.created can be
+        // processed (setConnected → the App effect sends the staged image's
+        // still frame + the initial source change stamped with the session
+        // clock) while connect() is still awaiting mic setup — created after
+        // the await, it is null at that moment and sendStill() silently drops
+        // the frame (frames never reach the model → it answers <|silence|>).
         if (videoEl) {
           // operator-set frames/sec (streaming model param) → falls back to the
           // 1 fps default; guarded to a sane floor so the sampler never stalls.
@@ -449,6 +451,10 @@ export function useSession(callbacks: UseSessionCallbacks) {
             (jpeg, ts) => socketRef.current?.sendFrame(jpeg, ts),
             { fps: frameFps, shouldSend: uplinkOk, clock: initialClock ?? 'live' },
           );
+        }
+        if (stream && stream.getAudioTracks().length > 0) {
+          micRef.current = await startMicCapture(stream, (pcm) => socketRef.current?.sendMic(pcm));
+          updateMicGate();
         }
         reportTimerRef.current = setInterval(() => {
           const player = playerRef.current;

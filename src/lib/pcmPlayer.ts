@@ -14,9 +14,9 @@ export class PcmPlayer {
   private nextStartTime = 0;
   private sources = new Map<string, Set<AudioBufferSourceNode>>();
 
-  private ensureContext(): AudioContext {
+  private ensureContext(sampleRate?: number): AudioContext {
     if (!this.ctx) {
-      this.ctx = new AudioContext();
+      this.ctx = new AudioContext({ sampleRate: sampleRate || 48000 });
       this.master = this.ctx.createGain();
       this.analyser = this.ctx.createAnalyser();
       this.analyser.fftSize = 256;
@@ -33,7 +33,7 @@ export class PcmPlayer {
   playChunk(responseId: string, pcm: ArrayBuffer, sampleRate: number, channels: number): void {
     const frames = Math.floor(pcm.byteLength / 2 / channels);
     if (frames <= 0) return;
-    const ctx = this.ensureContext();
+    const ctx = this.ensureContext(sampleRate);
     const buffer = ctx.createBuffer(channels, frames, sampleRate);
     const samples = new Int16Array(pcm, 0, frames * channels);
     for (let ch = 0; ch < channels; ch++) {
