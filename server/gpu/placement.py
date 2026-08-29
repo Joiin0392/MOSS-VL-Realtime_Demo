@@ -21,6 +21,7 @@ from typing import List, Optional, Tuple
 
 from ..config import Settings
 from ..logging_conf import get_logger
+from ..device_compat import device_str as _device_str, is_npu
 from .topology import GpuInfo, probe_topology, select_attn_impl
 
 log = get_logger(__name__)
@@ -145,11 +146,21 @@ def plan_placement(topology: List[GpuInfo], settings: Settings) -> PlacementPlan
         if skipped:
             warnings.append(
                 f"GPUs {skipped} skipped for VLM (free < {settings.vlm_min_free_mib} MiB)")
-        n_off = offline_gpu_count(len(eligible), settings, warnings)
-        # offline takes the HIGHEST indices: online workers keep their
-        # lowest-first ordering and the low-GPU session affinity stays intact
-        offline_gpus = eligible[len(eligible) - n_off:]
-        worker_gpus = eligible[:len(eligible) - n_off]
+        # explicit OFFLINE_GPUS pins the plane (highest-index default can land
+        # on cards the sglang NPU engine cannot address)
+        pinned = [int(p) for p in (settings.offline_gpus or "").split(",") if p.strip() != ""]
+        if pinned:
+            missing = [i for i in pinned if i not in by_index]
+            if missing:
+                warnings.append(f"OFFLINE_GPUS names unknown GPU indices {missing}")
+            offline_gpus = [i for i in pinned if i in by_index]
+            worker_gpus = [i for i in eligible if i not in set(offline_gpus)] or [settings.gpu_id]
+        else:
+            n_off = offline_gpu_count(len(eligible), settings, warnings)
+            # offline takes the HIGHEST indices: online workers keep their
+            # lowest-first ordering and the low-GPU session affinity stays intact
+            offline_gpus = eligible[len(eligible) - n_off:]
+            worker_gpus = eligible[:len(eligible) - n_off]
     if not worker_gpus:
         # degenerate fallback: keep today's single-GPU behavior alive rather
         # than refusing to start (dev boxes, busy GPUs, missing nvidia-smi)
@@ -184,9 +195,9 @@ def plan_placement(topology: List[GpuInfo], settings: Settings) -> PlacementPlan
     asr_device = (settings.asr_device or "auto").strip()
     if asr_device.lower() == "auto":
         if online_indices:
-            asr_device = f"cuda:{online_indices[-1]}"
+            asr_device = _device_str(online_indices[-1])
         else:
-            asr_device = "cuda:0"  # pre-multi-GPU default
+            asr_device = _device_str(0)
 
     # ---- TTS sidecars: ceil(workers / sessions_per_sidecar), high GPUs first ----
     # a vLLM-Omni engine continuous-batches concurrent streams, so it carries
