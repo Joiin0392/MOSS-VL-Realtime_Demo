@@ -194,6 +194,7 @@ class HfMossVlAdapter:
         log.info("Model loaded to CPU, moving to %s", device)
         model = model.to(device)
         model.eval()
+        self._fix_rope_inv_freq(model)
 
         from transformers import AutoProcessor
         processor = AutoProcessor.from_pretrained(processor_path, trust_remote_code=True)
@@ -223,6 +224,7 @@ class HfMossVlAdapter:
             try:
                 model = ModelClass.from_pretrained(model_path, attn_implementation=attn, **base)
                 self._attn_impl = attn
+                self._fix_rope_inv_freq(model)
                 return model
             except (ImportError, ValueError, RuntimeError) as exc:
                 if attn == attempts[-1]:
@@ -241,6 +243,60 @@ class HfMossVlAdapter:
             "active_sessions": len(self._sessions),
             "modes": list(self.caps.modes),
         }
+
+    @staticmethod
+    def _fix_rope_inv_freq(model: Any) -> None:
+        """Repair inv_freq if from_pretrained corrupted it.
+
+        HF's trust_remote_code loading can overwrite RoPE inv_freq buffers
+        with garbage from the state dict, producing NaN or garbage values
+        in cos/sin and propagating through every layer. Re-compute from
+        config and overwrite the buffers directly.
+        """
+        import torch
+        # Fix text RoPE
+        try:
+            rotary = getattr(getattr(getattr(model, "model", None), "language_model", None), "rotary_emb", None)
+            if rotary is not None:
+                inv_freq = getattr(rotary, "inv_freq", None)
+                # Check for NaN/Inf OR garbage values (first value must be ≈1.0)
+                needs_fix = (inv_freq is None
+                             or not torch.isfinite(inv_freq).all()
+                             or abs(inv_freq[0].item() - 1.0) > 0.01)
+                if needs_fix:
+                    cfg = rotary.config
+                    base = getattr(cfg, "rope_theta", 10000.0)
+                    head_dim = getattr(cfg, "head_dim", None) or cfg.hidden_size // cfg.num_attention_heads
+                    clean = 1.0 / (base ** (torch.arange(0, head_dim, 2, device="cpu").float() / head_dim))
+                    clean = clean.to(inv_freq.device if inv_freq is not None else model.device)
+                    rotary.register_buffer("inv_freq", clean, persistent=False)
+                    rotary.original_inv_freq = clean
+                    if hasattr(rotary, "_inv_freq_computed"):
+                        rotary._inv_freq_computed = clean
+                    log.warning("Repaired corrupted text RoPE inv_freq")
+        except Exception as exc:
+            log.warning("text inv_freq repair skipped: %s", exc)
+        # Fix vision RoPE
+        try:
+            vm = getattr(getattr(model, "model", None), "visual", None)
+            if vm is not None and hasattr(vm, "rotary_pos_emb"):
+                vre = vm.rotary_pos_emb
+                inv_freq = getattr(vre, "inv_freq", None)
+                # Vision inv_freq should be monotonically decreasing starting at 1.0.
+                # Garbage from state dict has random values (e.g. 9e-5, 3e-41, 0, 0, 1e27).
+                needs_fix = (inv_freq is None
+                             or not torch.isfinite(inv_freq).all()
+                             or abs(inv_freq[0].item() - 1.0) > 0.01)  # first value must be ≈1.0
+                if needs_fix:
+                    theta = 10000.0
+                    dim = inv_freq.shape[0] * 2 if inv_freq is not None else 36
+                    clean = 1.0 / (theta ** (torch.arange(0, dim, 2, device="cpu").float() / dim))
+                    vre.register_buffer("inv_freq", clean.to(inv_freq.device if inv_freq is not None else model.device), persistent=False)
+                    if hasattr(vre, "_inv_freq_clean"):
+                        vre._inv_freq_clean = clean
+                    log.warning("Repaired corrupted vision RoPE inv_freq (values were garbage)")
+        except Exception as exc:
+            log.warning("vision inv_freq repair skipped: %s", exc)
 
     # ---- realtime ----
 
