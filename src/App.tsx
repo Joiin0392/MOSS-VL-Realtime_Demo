@@ -1792,7 +1792,9 @@ export default function App() {
     // to the vision encoder (512px turns a 1080p screen into unreadable blobs
     // → hallucinated transcription); camera keeps the token-cheap 512px
     session.setSamplerProfile(
-      kind === 'screen' ? { maxEdge: 1280, quality: 0.85 } : { maxEdge: 512, quality: 0.75 },
+      kind === 'screen'
+        ? { maxEdge: 1280, quality: 0.85, effFps: 1, dedup: true }
+        : { maxEdge: 512, quality: 0.75, effFps: 2, dedup: false },
     );
     announceSource(kind); // one segment per KIND — a camera flip stays quiet
     addLog(kind === 'screen'
