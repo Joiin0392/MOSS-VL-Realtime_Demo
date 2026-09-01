@@ -178,12 +178,16 @@ export function useSession(callbacks: UseSessionCallbacks) {
   const playerRef = useRef<PcmPlayer | null>(null);
   const micRef = useRef<MicCapture | null>(null);
   const samplerRef = useRef<FrameSampler | null>(null);
-  // source-aware capture profile: camera keeps the token-cheap 512px, a
-  // screen-share raises it (screen text needs the pixels); read per capture
-  const samplerProfileRef = useRef<{ maxEdge: number; quality: number }>({
-    maxEdge: 512,
-    quality: 0.75,
-  });
+  // source-aware capture profile: camera keeps the token-cheap 512px @2fps,
+  // a screen-share raises the pixels but slows the cadence AND dedups frames
+  // (static screen content must not stream vision tokens — a 1280px @2fps
+  // stream once OOM'd the realtime KV cache within 5 minutes)
+  const samplerProfileRef = useRef<{
+    maxEdge: number;
+    quality: number;
+    effFps: number;
+    dedup: boolean;
+  }>({ maxEdge: 512, quality: 0.75, effFps: 2, dedup: false });
   const sessionIdRef = useRef<string | null>(null);
   const reportTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
@@ -578,6 +582,8 @@ export function useSession(callbacks: UseSessionCallbacks) {
               clock: initialClock ?? 'live',
               maxEdge: () => samplerProfileRef.current.maxEdge,
               quality: () => samplerProfileRef.current.quality,
+              effFps: () => samplerProfileRef.current.effFps,
+              dedup: () => samplerProfileRef.current.dedup,
             },
           );
         }
@@ -728,12 +734,15 @@ export function useSession(callbacks: UseSessionCallbacks) {
     updateMicGate();
   }, []);
 
-  /** Source-aware capture profile (mid-session safe): camera default is the
-   *  token-cheap 512px/0.75; a screen-share wants 1280px/0.85 so on-screen
-   *  text stays legible to the vision encoder. */
-  const setSamplerProfile = useCallback((profile: { maxEdge: number; quality: number }) => {
-    samplerProfileRef.current = profile;
-  }, []);
+  /** Source-aware capture profile (mid-session safe): camera = token-cheap
+   *  512px/0.75 @2fps; screen-share = 1280px/0.85 @1fps WITH frame dedup —
+   *  legible text without the vision-token firehose. */
+  const setSamplerProfile = useCallback(
+    (profile: { maxEdge: number; quality: number; effFps: number; dedup: boolean }) => {
+      samplerProfileRef.current = profile;
+    },
+    [],
+  );
 
   const setVideoForwarding = useCallback((on: boolean) => {
     videoOnRef.current = on;
