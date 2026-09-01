@@ -17,8 +17,11 @@ export type SamplerClock = 'live' | 'media';
 
 export interface FrameSamplerOptions {
   fps?: number;
-  maxEdge?: number;
-  quality?: number;
+  /** Static cap, or a per-capture getter — the source-aware profile lets a
+   * mid-session camera → screen-share swap raise the cap without rebuilding
+   * the sampler (screen text needs ~1280px to stay legible; camera 512). */
+  maxEdge?: number | (() => number);
+  quality?: number | (() => number);
   /** Skip capture when false (e.g. ws.bufferedAmount too high, camera off). */
   shouldSend?: () => boolean;
   /** Timestamp basis of the FIRST segment (default 'live'). A media segment
@@ -94,7 +97,9 @@ export function startFrameSampler(
       lastSampledMediaS = video.currentTime;
     }
 
-    const scale = Math.min(1, maxEdge / Math.max(video.videoWidth, video.videoHeight));
+    const edge = typeof maxEdge === 'function' ? maxEdge() : maxEdge;
+    const q = typeof quality === 'function' ? quality() : quality;
+    const scale = Math.min(1, edge / Math.max(video.videoWidth, video.videoHeight));
     canvas.width = Math.max(2, Math.round(video.videoWidth * scale));
     canvas.height = Math.max(2, Math.round(video.videoHeight * scale));
     ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
@@ -118,7 +123,7 @@ export function startFrameSampler(
           });
       },
       'image/jpeg',
-      quality,
+      q,
     );
   };
 
