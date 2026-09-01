@@ -1788,6 +1788,12 @@ export default function App() {
     setVideoSourceKind(kind);
     setVideoEnabled(true);
     if (streamConnected) session.setVideoForwarding(true);
+    // source-aware capture profile: screen text needs ~1280px to stay legible
+    // to the vision encoder (512px turns a 1080p screen into unreadable blobs
+    // → hallucinated transcription); camera keeps the token-cheap 512px
+    session.setSamplerProfile(
+      kind === 'screen' ? { maxEdge: 1280, quality: 0.85 } : { maxEdge: 512, quality: 0.75 },
+    );
     announceSource(kind); // one segment per KIND — a camera flip stays quiet
     addLog(kind === 'screen'
       ? (language === 'en' ? 'Screen sharing active.' : '屏幕共享推流就绪。')

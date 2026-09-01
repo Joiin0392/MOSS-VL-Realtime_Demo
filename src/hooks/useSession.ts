@@ -158,6 +158,12 @@ export function useSession(callbacks: UseSessionCallbacks) {
   const playerRef = useRef<PcmPlayer | null>(null);
   const micRef = useRef<MicCapture | null>(null);
   const samplerRef = useRef<FrameSampler | null>(null);
+  // source-aware capture profile: camera keeps the token-cheap 512px, a
+  // screen-share raises it (screen text needs the pixels); read per capture
+  const samplerProfileRef = useRef<{ maxEdge: number; quality: number }>({
+    maxEdge: 512,
+    quality: 0.75,
+  });
   const sessionIdRef = useRef<string | null>(null);
   const reportTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
@@ -447,7 +453,13 @@ export function useSession(callbacks: UseSessionCallbacks) {
           samplerRef.current = startFrameSampler(
             videoEl,
             (jpeg, ts) => socketRef.current?.sendFrame(jpeg, ts),
-            { fps: frameFps, shouldSend: uplinkOk, clock: initialClock ?? 'live' },
+            {
+              fps: frameFps,
+              shouldSend: uplinkOk,
+              clock: initialClock ?? 'live',
+              maxEdge: () => samplerProfileRef.current.maxEdge,
+              quality: () => samplerProfileRef.current.quality,
+            },
           );
         }
         reportTimerRef.current = setInterval(() => {
@@ -573,6 +585,13 @@ export function useSession(callbacks: UseSessionCallbacks) {
     updateMicGate();
   }, []);
 
+  /** Source-aware capture profile (mid-session safe): camera default is the
+   *  token-cheap 512px/0.75; a screen-share wants 1280px/0.85 so on-screen
+   *  text stays legible to the vision encoder. */
+  const setSamplerProfile = useCallback((profile: { maxEdge: number; quality: number }) => {
+    samplerProfileRef.current = profile;
+  }, []);
+
   const setVideoForwarding = useCallback((on: boolean) => {
     videoOnRef.current = on;
   }, []);
@@ -614,6 +633,7 @@ export function useSession(callbacks: UseSessionCallbacks) {
     getSessionTsMs,
     sendImageFrame,
     sendSourceChange,
+    setSamplerProfile,
     cancelResponse,
     updateConfig,
     setMicMuted,
