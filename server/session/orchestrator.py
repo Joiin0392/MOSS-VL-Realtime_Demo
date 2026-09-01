@@ -802,6 +802,16 @@ class Orchestrator:
     def _handle_control_token(self, token: str) -> None:
         if token == ROUND_START:
             self._drop_model_tail = False  # an explicit round always speaks
+            # backlog gate: while the listener is far behind on unplayed audio,
+            # a new narration round would only queue text the listener can't
+            # hear yet (and be retired unspoken by the next round — measured:
+            # 68% of camera rounds never reached synthesis). Hold such rounds
+            # at silence; the gate opens as soon as the backlog drains.
+            gate_s = self.settings.realtime_backlog_gate_s
+            if gate_s > 0 and self.audio_queue_seconds() >= gate_s:
+                self.metrics["gated_rounds"] = self.metrics.get("gated_rounds", 0) + 1
+                self._drop_model_tail = True  # swallow this round's narration
+                return
             self._open_response()
         elif token in SILENCE_TOKENS:
             self.metrics["silence_outputs"] += 1
@@ -881,10 +891,20 @@ class Orchestrator:
         # drop the backlog, not the mouth).
         if len(self._responses) >= 2:
             speaking = self._tts_turn_id
-            for old in list(self._responses.values()):
-                if old.response_id != speaking and not old.done:
-                    old.stop_reason = p.STOP_INTERRUPTED
-                    self._complete_response(old)
+            retiring = [old for old in self._responses.values()
+                        if old.response_id != speaking and not old.done]
+            newest_retired = max((r.response_id for r in retiring),
+                                 key=self._round_serial, default=None)
+            for old in retiring:
+                old.stop_reason = p.STOP_INTERRUPTED
+                self._complete_response(old)
+                # retire = drop its queued units too: the feeder skips units
+                # of done responses, so leaving them in the deque is pure
+                # dead weight. The NEWEST retired round's units are kept —
+                # under gate/backlog churn that round describes the current
+                # scene best; older narrations are the stale ones.
+                if old.response_id != newest_retired:
+                    self._retire_units(old.response_id)
         rid = f"resp_{next(self._serial)}"
         t0 = self._pending_turn_t0 or time.monotonic()
         self._pending_turn_t0 = None
@@ -896,6 +916,30 @@ class Orchestrator:
         self.metrics["responses"] += 1
         self.state.emit(p.RESPONSE_CREATED, response_id=rid)
         return new
+
+    @staticmethod
+    def _round_serial(rid: str) -> int:
+        """Monotonic serial of a resp_N id (older rounds sort lower)."""
+        try:
+            return int(rid.rsplit("_", 1)[-1])
+        except ValueError:
+            return -1
+
+    def _retire_units(self, response_id: str) -> None:
+        """Drop a retired response's queued units (segments AND its flush marker).
+
+        The feeder skips segments of done responses, and a stale flush marker
+        would mis-fire end_turn for a turn the engine never spoke — so both
+        must go. Called for every retired round except the newest one, whose
+        units survive so the freshest description can still play once the
+        backlog drains.
+        """
+        before = len(self._units)
+        self._units = type(self._units)(
+            u for u in self._units if u.response_id != response_id)
+        dropped = before - len(self._units)
+        if dropped:
+            self.metrics["units_dropped"] += dropped
 
     def _finalize_response(self, stop_reason: str) -> None:
         r = self._response

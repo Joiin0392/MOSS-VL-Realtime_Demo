@@ -592,6 +592,11 @@ class Settings:
     # never skips sentences, at the cost of narrating further behind if the
     # engine can't keep up — safe once TTS is fast, e.g. moss_tts_realtime).
     tts_drop_stale: bool = field(default_factory=lambda: _env_flag("TTS_DROP_STALE", True))
+    # camera-realtime pacing: while the client is this many seconds behind on
+    # unplayed TTS audio, a NEW model round is held at silence instead of
+    # opening a response — narration the listener can't hear yet only builds
+    # backlog that later retires unspoken (0 disables the gate)
+    realtime_backlog_gate_s: float = field(default_factory=lambda: _env_float("REALTIME_BACKLOG_GATE_S", 8.0))
     # drop the oldest un-synthesized unit beyond this backlog, and any unit older
     # than max_age at feed time (0 disables either check). Relaxed 6 -> 24 so a
     # normal turn's sentences are not discarded as "backlog" when TTS lags.
