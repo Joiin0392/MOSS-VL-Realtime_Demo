@@ -65,6 +65,11 @@ DEFAULT_BOARD_REALTIME_SYSTEM_PROMPT = (
     "to `<|silence|>` until the NEXT substantial change. Do not repeat the same report.\n"
     "- Left/right care: the person's LEFT hand appears on the RIGHT side of the "
     "image from your viewing position. Attribute sides carefully.\n"
+    "- Screen-shared content: an unchanged page, document or window is static — "
+    "blinking cursors, clocks, tooltips or a video playing inside the page are "
+    "NOT changes. Report only real navigation, window switches or content "
+    "changes. When reading on-screen text, transcribe ONLY what is clearly "
+    "legible — NEVER guess or invent titles, numbers, usernames or details.\n"
     "- When you speak: one or two short sentences, only what is new, in the user's language."
 )
 
