@@ -272,6 +272,10 @@ class Settings:
     offline_gpu_ratio: float = field(default_factory=lambda: _env_float("OFFLINE_GPU_RATIO", 0.25))
     # explicit offline GPU count (clamped to n_eligible - 1); None = ratio rule
     offline_gpu_count: Optional[int] = field(default_factory=lambda: _env_opt_int("OFFLINE_GPU_COUNT"))
+    # explicit offline GPU indices (comma-separated) — wins over count/ratio;
+    # symmetric with VLM_WORKER_GPUS. On NPU boxes the highest-index default
+    # can land on a card the sglang engine cannot address.
+    offline_gpus: str = field(default_factory=lambda: _env("OFFLINE_GPUS", ""))
     sglang_python: str = field(default_factory=lambda: _env(
         "SGLANG_PYTHON", os.path.join(REPO_ROOT, ".venv-sglang", "bin", "python")))
     # NOT sglang's default 30000: this box is shared, and adopt-if-healthy must

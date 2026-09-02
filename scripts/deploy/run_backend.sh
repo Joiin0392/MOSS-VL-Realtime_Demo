@@ -48,5 +48,8 @@ export PYTHONUNBUFFERED=1
 
 cd "$REPO"
 # uvloop (ships with uvicorn[standard]) keeps the WS plane snappy under load
-exec .venv/bin/python -m uvicorn server.app:app --host 127.0.0.1 --port "${PORT:-8000}" \
+# interpreter: .venv if built, else PYBIN from env (e.g. mamba python on NPU boxes)
+PYBIN="${PYBIN:-$REPO/.venv/bin/python}"
+[ -x "$PYBIN" ] || PYBIN="$(command -v python3 || echo python3)"
+exec "$PYBIN" -m uvicorn server.app:app --host 127.0.0.1 --port "${PORT:-8000}" \
   --loop "${UVICORN_LOOP:-uvloop}"

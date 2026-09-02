@@ -28,6 +28,9 @@ from fastapi.responses import StreamingResponse
 from ..config import Settings, get_settings
 from ..gpu.kv_budget import KvBudget, compute_kv_budget, kv_bytes_per_token
 from ..logging_conf import configure_logging, get_logger
+from ..device_compat import (is_available, get_device_properties,
+                                  mem_get_info, memory_allocated, memory_reserved,
+                                  empty_cache)
 from ..schemas import ChatRequest
 from . import protocol as wp
 
@@ -56,29 +59,27 @@ class WorkerState:
     def gpu_snapshot(self) -> Dict[str, Any]:
         if self.fake:
             return {"name": "fake", "cc": [0, 0], "mem_total_mib": 0, "mem_used_mib": 0}
-        import torch
 
-        if not torch.cuda.is_available():
+        if not is_available():
             return {"name": "cpu", "cc": [0, 0], "mem_total_mib": 0, "mem_used_mib": 0}
-        props = torch.cuda.get_device_properties(0)
-        free, total = torch.cuda.mem_get_info(0)
+        props = get_device_properties(0)
+        free, total = mem_get_info(0)
         return {
             "name": props.name,
             "cc": [props.major, props.minor],
             "mem_total_mib": total // 2**20,
             "mem_used_mib": (total - free) // 2**20,
-            "mem_allocated_gb": round(torch.cuda.memory_allocated(0) / 2**30, 2),
-            "mem_reserved_gb": round(torch.cuda.memory_reserved(0) / 2**30, 2),
+            "mem_allocated_gb": round(memory_allocated(0) / 2**30, 2),
+            "mem_reserved_gb": round(memory_reserved(0) / 2**30, 2),
         }
 
     def kv_used_tokens(self) -> int:
         if self.fake or self.kv is None or self.session is None:
             return 0
-        import torch
 
-        if not torch.cuda.is_available():
+        if not is_available():
             return 0
-        grown = max(0, torch.cuda.memory_allocated(0) - self.baseline_alloc)
+        grown = max(0, memory_allocated(0) - self.baseline_alloc)
         return int(grown // max(1, self.kv.bytes_per_token))
 
     def kv_payload(self) -> Optional[Dict[str, Any]]:
@@ -158,9 +159,9 @@ def _load_model(state: WorkerState, model_path: str, hf_mode: str,
 
     state.adapter.load(model_path, 0, hf_mode, attn_impl_override=attn_impl)
     _warmup_and_verify_attn(state.adapter)
-    torch.cuda.empty_cache()
-    state.baseline_alloc = torch.cuda.memory_allocated(0)
-    free, total = torch.cuda.mem_get_info(0)
+    empty_cache()
+    state.baseline_alloc = memory_allocated(0)
+    free, total = mem_get_info(0)
     try:
         bpt = kv_bytes_per_token(state.adapter.model_config)
     except ValueError as exc:
@@ -324,10 +325,9 @@ def create_worker_app(worker_id: int = 0) -> FastAPI:
                 # OOM backstop: trip on real free VRAM regardless of token math
                 free_low = False
                 if not state.fake:
-                    import torch
 
-                    if torch.cuda.is_available():
-                        free, _ = torch.cuda.mem_get_info(0)
+                    if is_available():
+                        free, _ = mem_get_info(0)
                         free_low = free < state.settings.kv_safety_margin_mib * 2**20
                 if used_ratio >= KV_WARN_RATIO and not warned:
                     warned = True

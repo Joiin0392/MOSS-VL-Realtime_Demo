@@ -31,6 +31,7 @@ from typing import Any, Dict, List, Optional
 
 from ..config import Settings
 from ..logging_conf import get_logger
+from ..device_compat import set_visible_device
 from ..sidecars import spawn_tts_sidecar, stop_tts_sidecar
 from .placement import OfflineSpec, PlacementPlan, TtsSpec, WorkerSpec
 
@@ -81,7 +82,7 @@ class VlmWorkerSupervisor:
 
     def _worker_env(self, spec: WorkerSpec) -> Dict[str, str]:
         env = _with_ffmpeg_libs(dict(os.environ), self.s)
-        env["CUDA_VISIBLE_DEVICES"] = str(spec.gpu_index)
+        set_visible_device(env, spec.gpu_index)
         env["VLM_WORKER_ATTN"] = spec.attn_impl
         env["VLM_WORKER_FAKE"] = "1" if spec.fake else "0"
         # workers autoload (mirrors the gateway's old maybe_load_vlm condition);
@@ -343,7 +344,7 @@ class SglangSidecarSupervisor:
 
     def _env(self, spec: OfflineSpec) -> Dict[str, str]:
         env = _with_ffmpeg_libs(dict(os.environ), self.s)
-        env["CUDA_VISIBLE_DEVICES"] = str(spec.gpu_index)
+        set_visible_device(env, spec.gpu_index)
         env["HF_HUB_OFFLINE"] = "1"
         env["TRANSFORMERS_OFFLINE"] = "1"
         env["PYTHONUNBUFFERED"] = "1"
