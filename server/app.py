@@ -26,7 +26,7 @@ from .gpu.placement import format_plan, plan_placement
 from .gpu.supervisor import SglangSidecarSupervisor, TtsSidecarPool, VlmWorkerSupervisor
 from .gpu.topology import probe_topology
 from .logging_conf import configure_logging, get_logger
-from .routers import chat, history, media, ops, session_ws, sessions, speech
+from .routers import chat, history, media, openai, ops, session_ws, sessions, speech
 
 log = get_logger(__name__)
 
@@ -136,6 +136,8 @@ def create_app() -> FastAPI:
     # durable history + CAS media store (server/persistence/)
     app.include_router(history.router)
     app.include_router(media.router)
+    # OpenAI-compatible surface (v1/chat/completions) over the Realtime VLM
+    app.include_router(openai.router)
     return app
 
 
