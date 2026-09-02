@@ -660,7 +660,12 @@ class Orchestrator:
 
         frame = None
         latest = self._latest_frame
-        if latest is not None and (time.monotonic() - latest[2]) <= self.settings.frame_max_age_s:
+        # A still-image source is a persistent scene: its frame never goes
+        # stale (the user picks an image, then asks about it seconds or
+        # minutes later — frame_max_age_s must not expire it into a blind
+        # text-only turn, which the realtime model answers with <|silence|>).
+        still_source = bool(self._segment and self._segment.get("kind") == "image")
+        if latest is not None and (still_source or (time.monotonic() - latest[2]) <= self.settings.frame_max_age_s):
             frame = latest
         try:
             if frame is not None:
