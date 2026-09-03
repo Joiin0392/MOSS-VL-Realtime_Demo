@@ -2906,6 +2906,7 @@ class MossVLForConditionalGeneration(MossVLPreTrainedModel, GenerationMixin):
         self.continue_generating = True
 
     def stop_real_time_generate(self):
+        self.continue_generating = False
         gc.collect()
         try:
             import torch_npu  # noqa: F401
@@ -2914,7 +2915,6 @@ class MossVLForConditionalGeneration(MossVLPreTrainedModel, GenerationMixin):
         except ImportError:
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
-        self.continue_generating = False
 
     @staticmethod
     def _compute_realtime_mrope_for_segment(
