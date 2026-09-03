@@ -1149,10 +1149,12 @@ class Orchestrator:
                     sample_rate=sample_rate,
                     channels=channels,
                     pcm_bytes=len(pcm),
+                    transient=True,
                 )
             elif kind == "tts_turn_end":
                 if r is not None and r.finalized and not r.done:
-                    self.state.emit(p.RESPONSE_AUDIO_DONE, response_id=r.response_id)
+                    self.state.emit(p.RESPONSE_AUDIO_DONE, response_id=r.response_id,
+                                    transient=True)
                     self._complete_response(r)
             elif kind == "tts_error":
                 self._emit_error("tts_error", str(payload.get("message") or "synthesis failed"))
