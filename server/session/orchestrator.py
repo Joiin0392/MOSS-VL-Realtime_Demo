@@ -1060,7 +1060,16 @@ class Orchestrator:
                 continue
             head = self._units[0]
             if head.kind == "segment" and not self.should_emit_next_unit():
-                await asyncio.sleep(0.1)
+                # Buffer saturated: instead of a long silent pause, drop the
+                # OLDEST pending unit and keep the pipeline flowing — audio
+                # never stops, the oldest queued speech simply gets skipped.
+                for i, unit in enumerate(self._units):
+                    if unit.kind == "segment":
+                        del self._units[i]
+                        self.metrics["units_dropped"] += 1
+                        log.info("drop-stale: buffer-saturated unit dropped (%r…)", unit.text[:24])
+                        break
+                await asyncio.sleep(0.05)
                 continue
             if self._tts_turn_id and head.response_id != self._tts_turn_id:
                 previous = self._responses.get(self._tts_turn_id)
