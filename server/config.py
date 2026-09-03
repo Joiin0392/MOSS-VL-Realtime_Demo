@@ -109,6 +109,10 @@ def _env_flag(name: str, default: bool) -> bool:
     return v.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _env_str(name: str, default: str) -> str:
+    return os.getenv(name, default)
+
+
 # --------------------- .env.deploy (config layer 3) ---------------------
 
 _KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -597,6 +601,19 @@ class Settings:
     # opening a response — narration the listener can't hear yet only builds
     # backlog that later retires unspoken (0 disables the gate)
     realtime_backlog_gate_s: float = field(default_factory=lambda: _env_float("REALTIME_BACKLOG_GATE_S", 8.0))
+    # motion gate: server-side frame-difference gate over camera narration.
+    # A 32x18 grayscale signature is diffed per frame; the smoothed diff feeds
+    # two decisions at ROUND_START: below MOTION_GATE_SUPPRESS_THRESHOLD the
+    # round is held at silence (no visual change → don't narrate a static
+    # scene), while a rising diff above MOTION_GATE_FORCE_THRESHOLD guarantees
+    # narration — a silence token in that state is intercepted and the model is
+    # prompted to describe the change. Disable with MOTION_GATE_ENABLED=0.
+    motion_gate_enabled: bool = field(default_factory=lambda: _env_flag("MOTION_GATE_ENABLED", True))
+    motion_gate_suppress_threshold: float = field(default_factory=lambda: _env_float("MOTION_GATE_SUPPRESS_THRESHOLD", 0.08))
+    motion_gate_force_threshold: float = field(default_factory=lambda: _env_float("MOTION_GATE_FORCE_THRESHOLD", 0.20))
+    motion_gate_cooldown_s: float = field(default_factory=lambda: _env_float("MOTION_GATE_COOLDOWN_S", 3.0))
+    motion_gate_prompt: str = field(default_factory=lambda: _env_str("MOTION_GATE_PROMPT",
+        "There is a noticeable change in the video. Describe what just changed in one or two short sentences."))
     # drop the oldest un-synthesized unit beyond this backlog, and any unit older
     # than max_age at feed time (0 disables either check). Relaxed 6 -> 24 so a
     # normal turn's sentences are not discarded as "backlog" when TTS lags.

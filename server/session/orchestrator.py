@@ -162,6 +162,16 @@ class Orchestrator:
         # kept encoded: decode is the VLM session's job (worker-side)
         self._latest_frame: Optional[Tuple[bytes, Optional[float], float]] = None
         self._vlm_dead = False
+        # ---- motion gate (server-side frame-diff narration gate) ----
+        # smoothed 32x18 grayscale frame-diff (0..1); drives ROUND_START
+        # suppression (static scene → silence) and silence interception
+        # (fresh change → force the model to narrate it)
+        self._motion_level = 0.0
+        self._motion_episode_active = False   # level >= suppress threshold
+        self._motion_narrated = False          # current episode already spoken
+        self._last_sig: Optional[bytes] = None
+        self._force_prompt_at = 0.0            # monotonic of last injected prompt
+        self._motion_tasks: set = set()        # keep force-narration tasks alive
         # current video-source segment from `input.video.source` (None until the
         # client announces one — legacy clients never do). Frame timestamps ride
         # one monotone session clock (live_control_overhaul.md §12); file
@@ -286,6 +296,7 @@ class Orchestrator:
             self._emit_error("bad_frame", "frame payload is not a JPEG")
             return
         self._latest_frame = (jpeg, timestamp, time.monotonic())
+        self._update_motion(jpeg)
         if self.memory is not None:
             try:
                 # throttled + enqueue-only; real dedup runs on the writer thread
@@ -804,9 +815,60 @@ class Orchestrator:
             elif part:
                 self._handle_content(part, emitted_at)
 
+    # ---- motion gate (frame-diff narration gate) -------------------------
+
+    def _motion_gate_active(self) -> bool:
+        s = self.settings
+        if not s.motion_gate_enabled:
+            return False
+        seg = self._segment or {}
+        return seg.get("kind") in (None, "camera", "screen")
+
+    def _update_motion(self, jpeg: bytes) -> None:
+        s = self.settings
+        if not s.motion_gate_enabled:
+            return
+        try:
+            from io import BytesIO
+            from PIL import Image
+            img = Image.open(BytesIO(jpeg)).convert("L").resize((32, 18))
+            sig = img.tobytes()
+            if self._last_sig is not None and len(sig) == len(self._last_sig):
+                diff = sum(abs(a - b) for a, b in zip(sig, self._last_sig)) / len(sig) / 255.0
+                self._motion_level = self._motion_level * 0.6 + diff * 0.4
+                if self._motion_level >= s.motion_gate_suppress_threshold:
+                    if not self._motion_episode_active:
+                        self._motion_episode_active = True
+                        self._motion_narrated = False
+                else:
+                    self._motion_episode_active = False
+            self._last_sig = sig
+        except Exception:
+            pass
+
+    async def _force_narration(self) -> None:
+        if self._vlm_dead:
+            return
+        try:
+            await asyncio.to_thread(self.engines.vlm.put_prompt, self.settings.motion_gate_prompt)
+            self._motion_narrated = True
+            self.metrics["motion_forced"] = self.metrics.get("motion_forced", 0) + 1
+            log.info("motion-gate: forced narration prompt")
+        except Exception as exc:
+            log.warning("motion-gate force prompt failed: %s", exc)
+
     def _handle_control_token(self, token: str) -> None:
         if token == ROUND_START:
             self._drop_model_tail = False  # an explicit round always speaks
+            # motion gate (narration rounds only — a pending user turn is the
+            # model answering, never suppressed): a static scene needs no
+            # narration, so hold the round at silence.
+            if (self._pending_turn_t0 is None
+                    and self._motion_gate_active()
+                    and self._motion_level < self.settings.motion_gate_suppress_threshold):
+                self.metrics["motion_suppressed"] = self.metrics.get("motion_suppressed", 0) + 1
+                self._drop_model_tail = True
+                return
             # backlog gate: while the listener is far behind on unplayed audio,
             # a new narration round would only queue text the listener can't
             # hear yet (and be retired unspoken by the next round — measured:
@@ -820,6 +882,21 @@ class Orchestrator:
             self._open_response()
         elif token in SILENCE_TOKENS:
             self.metrics["silence_outputs"] += 1
+            # motion gate: a fresh visual change the model failed to announce
+            # (silence despite motion) is forced — inject a prompt so the
+            # change is always narrated. Cooldown guards the re-injection loop.
+            s = self.settings
+            if (self._pending_turn_t0 is None
+                    and self._motion_gate_active()
+                    and self._motion_episode_active
+                    and not self._motion_narrated
+                    and self._motion_level >= s.motion_gate_force_threshold
+                    and time.monotonic() - self._force_prompt_at >= s.motion_gate_cooldown_s):
+                self._force_prompt_at = time.monotonic()
+                task = asyncio.create_task(self._force_narration())
+                self._motion_tasks.add(task)
+                task.add_done_callback(self._motion_tasks.discard)
+                return
             # the realtime model closes a spoken round by going idle —
             # <|silence|> IS the end-of-turn signal (it never emits
             # round_end/im_end on the output stream). Finalizing here splits
@@ -847,6 +924,10 @@ class Orchestrator:
         chunk = JUNK_TOKEN_RE.sub("", chunk)
         if not chunk:
             return
+        # motion gate: real text during an active motion episode means the
+        # change has been narrated — the silence branch will not re-inject.
+        if self._motion_episode_active and self._motion_gate_active():
+            self._motion_narrated = True
         r = self._response
         if not chunk.strip() and (r is None or r.finalized or r.done):
             return  # whitespace between control tokens must not open a response
