@@ -489,12 +489,13 @@ class HfMossVlAdapter:
         if session is None:
             raise KeyError(f"Realtime session not found: {session_id}")
         session.stop_event.set()
-        try:
-            stop_fn = getattr(self.model, "stop_real_time_generate", None)
-            if callable(stop_fn):
-                stop_fn()
-        except Exception:  # noqa: BLE001
-            pass
+        # stop_real_time_generate() may block on a device-sync call
+        # (torch.npu.empty_cache on a busy CANN device). Run it on a daemon
+        # thread so the join + force-release below always executes — the flag
+        # flip inside it makes the runner exit promptly regardless.
+        stop_fn = getattr(self.model, "stop_real_time_generate", None)
+        if callable(stop_fn):
+            threading.Thread(target=stop_fn, daemon=True).start()
         if session.thread is not None:
             session.thread.join(timeout=timeout_seconds)
             if session.thread.is_alive() and self._infer_lock_owner == session_id:
