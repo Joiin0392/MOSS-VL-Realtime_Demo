@@ -24,13 +24,17 @@ export class PcmPlayer {
 
   private ensureContext(sampleRate?: number): AudioContext {
     if (!this.ctx) {
-      this.ctx = new AudioContext({ sampleRate: sampleRate || 48000 });
-      this.master = this.ctx.createGain();
-      this.analyser = this.ctx.createAnalyser();
+      try {
+        this.ctx = new AudioContext({ sampleRate: sampleRate || 48000 });
+      } catch {
+        this.ctx = new AudioContext();
+      }
+      this.master = (this.ctx as AudioContext).createGain();
+      this.analyser = (this.ctx as AudioContext).createAnalyser();
       this.analyser.fftSize = 256;
       this.analyserData = new Uint8Array(this.analyser.frequencyBinCount);
       this.master.connect(this.analyser);
-      this.analyser.connect(this.ctx.destination);
+      this.analyser.connect((this.ctx as AudioContext).destination);
       this.nextStartTime = 0;
     }
     if (this.ctx.state === 'suspended') void this.ctx.resume();
@@ -42,12 +46,27 @@ export class PcmPlayer {
     const frames = Math.floor(pcm.byteLength / 2 / channels);
     if (frames <= 0) return;
     const ctx = this.ensureContext(sampleRate);
-    const buffer = ctx.createBuffer(channels, frames, sampleRate);
+    // Resample to the AudioContext's actual rate — forcing {sampleRate: 48000}
+    // made browsers resample on some devices, which produced aliasing noise.
+    const outRate = ctx.sampleRate;
+    const outFrames = outRate === sampleRate ? frames : Math.max(1, Math.round(frames * outRate / sampleRate));
+    const buffer = ctx.createBuffer(channels, outFrames, outRate);
     const samples = new Int16Array(pcm, 0, frames * channels);
     for (let ch = 0; ch < channels; ch++) {
       const dest = buffer.getChannelData(ch);
-      for (let i = 0; i < frames; i++) {
-        dest[i] = samples[i * channels + ch] / 0x8000;
+      if (outRate === sampleRate) {
+        for (let i = 0; i < frames; i++) {
+          dest[i] = samples[i * channels + ch] / 0x8000;
+        }
+      } else {
+        for (let i = 0; i < outFrames; i++) {
+          const src = i * frames / outFrames;
+          const i0 = Math.floor(src);
+          const frac = src - i0;
+          const v0 = samples[Math.min(i0, frames - 1) * channels + ch];
+          const v1 = samples[Math.min(i0 + 1, frames - 1) * channels + ch];
+          dest[i] = (v0 + (v1 - v0) * frac) / 0x8000;
+        }
       }
     }
 
