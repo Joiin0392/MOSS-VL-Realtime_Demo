@@ -3,8 +3,16 @@
 // (`turn.speech_started` / response.done{interrupted|cancelled}) can stop one
 // response's audio instantly. bufferedSeconds() feeds the server's §1C
 // back-pressure gate via `playback.status`; level() drives the orb.
+//
+// Lead time must stay ~0: any positive lead inserts a silent gap between
+// consecutive chunks (startAt = currentTime + lead when the previous chunk
+// already finished). Local TTS synthesizes each segment as a separate job, so
+// chunks arrive with real gaps — a 60ms lead made every boundary audible as a
+// "tick"/click. 0 lead = back-to-back scheduling; the browser buffers a tiny
+// latency instead (SCHEDULE_LEAD_S only mattered for first-play startup, where
+// nextStartTime=0 already schedules immediately).
 
-const SCHEDULE_LEAD_S = 0.06;
+const SCHEDULE_LEAD_S = 0.001;
 
 export class PcmPlayer {
   private ctx: AudioContext | null = null;
