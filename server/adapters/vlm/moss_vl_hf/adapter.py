@@ -146,6 +146,7 @@ class HfMossVlAdapter:
         self.model_config: dict = {}
         self._attn_impl: Optional[str] = None    # resolved at load()
         self._infer_lock = threading.Lock()      # one active realtime session per model
+        self._infer_lock_owner: Optional[str] = None  # session_id that holds _infer_lock
         self._sessions: Dict[str, RealtimeSession] = {}
         self._sessions_lock = threading.Lock()
 
@@ -339,6 +340,7 @@ class HfMossVlAdapter:
         self._ensure_realtime_ready()
         if not self._infer_lock.acquire(blocking=False):
             raise RuntimeError("A realtime session is already running on this model")
+        self._infer_lock_owner = None  # set once the session id exists
 
         try:
             s = self.s
@@ -370,6 +372,7 @@ class HfMossVlAdapter:
             install_realtime_token_counter_patch(self.model)
 
             session_id = str(uuid.uuid4())
+            self._infer_lock_owner = session_id
             frame_queue = RealTimeFrameQueue(maxsize=max(1, frame_queue_size or s.frame_queue_size))
             prompt_queue: "queue.Queue[str]" = queue.Queue()
             stop_event = threading.Event()
@@ -446,10 +449,12 @@ class HfMossVlAdapter:
                     except Exception:  # noqa: BLE001
                         pass
                     stop_event.set()
-                    try:
-                        self._infer_lock.release()
-                    except RuntimeError:
-                        pass
+                    if self._infer_lock_owner == session_id:
+                        self._infer_lock_owner = None
+                        try:
+                            self._infer_lock.release()
+                        except RuntimeError:
+                            pass
                     log.info(
                         "Realtime session %s exited (frames=%d consumed=%d outputs=%d non_silence=%d)",
                         session_id, session.frames_received, session.frames_consumed,
@@ -464,6 +469,7 @@ class HfMossVlAdapter:
             log.info("Started realtime session %s on %s", session_id, self.device)
             return session
         except Exception:
+            self._infer_lock_owner = None
             try:
                 self._infer_lock.release()
             except RuntimeError:
@@ -491,6 +497,18 @@ class HfMossVlAdapter:
             pass
         if session.thread is not None:
             session.thread.join(timeout=timeout_seconds)
+            if session.thread.is_alive() and self._infer_lock_owner == session_id:
+                # The runner is wedged in the model loop (NPU op in flight) and
+                # its finally-block cannot run — force-release the infer lock so
+                # a new session can start; the zombie's late finally sees the
+                # owner no longer matches and leaves the (re-acquired) lock alone.
+                log.warning("Realtime session %s thread stuck after %.0fs — "
+                            "force-releasing infer lock", session_id, timeout_seconds)
+                self._infer_lock_owner = None
+                try:
+                    self._infer_lock.release()
+                except RuntimeError:
+                    pass
         return session.status_payload()
 
     # ---- offline chat ----
