@@ -571,6 +571,13 @@ def _audio_to_pcm16le_bytes(audio_array) -> bytes:
         raise ValueError(f"Unsupported audio array shape: {audio_np.shape}")
 
     audio_np = np.clip(audio_np, -1.0, 1.0)
+    # Prevent hard-clip distortion: the model occasionally emits peaks > 1.0;
+    # scaling to 32767 without headroom flat-tops those samples, which is the
+    # audible "noise burst" mid-speech. Normalize the chunk's peak to 0.92 so
+    # the loudest sample stays below full scale.
+    peak = float(np.max(np.abs(audio_np))) if audio_np.size else 0.0
+    if peak > 0.92:
+        audio_np = audio_np * (0.92 / peak)
     audio_int16 = (audio_np * 32767.0).astype(np.int16)
     return audio_int16.tobytes()
 
