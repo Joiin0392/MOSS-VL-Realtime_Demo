@@ -38,11 +38,15 @@ def _settings(tmp: str, **over):
     # (the real defaults load ~3 GB of BGE-M3 + Chinese-CLIP weights)
     os.environ["MEMORY_EMBED_TEXT_MODEL"] = ""
     os.environ["MEMORY_EMBED_IMAGE_MODEL"] = ""
+    # this suite encodes the pre-pi local-vector gate semantics; the pi decide
+    # gate (default "hybrid") is covered by test_memory_pi.py against a fake pi
+    os.environ["MEMORY_DECISION_MODE"] = "vector"
     # tests set env overrides process-wide; drop leftovers from earlier tests so
     # one test's override never silently leaks into the next
     for key in list(os.environ):
         if key.startswith("MEMORY_") and key not in ("MEMORY_ENABLED", "MEMORY_EMBED_TEXT_MODEL",
-                                                     "MEMORY_EMBED_IMAGE_MODEL"):
+                                                     "MEMORY_EMBED_IMAGE_MODEL",
+                                                     "MEMORY_DECISION_MODE"):
             os.environ.pop(key)
     for key, val in over.items():
         os.environ[key] = str(val)

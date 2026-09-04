@@ -34,9 +34,13 @@ def _settings(tmp: str, **over) -> Settings:
     # pin the dependency-free fallbacks: this suite must stay hermetic and fast
     os.environ["MEMORY_EMBED_TEXT_MODEL"] = ""
     os.environ["MEMORY_EMBED_IMAGE_MODEL"] = ""
+    # pre-pi local-vector gate semantics; the pi paths are covered by
+    # test_memory_pi.py against a fake pi server
+    os.environ["MEMORY_DECISION_MODE"] = "vector"
     for key in list(os.environ):
         if key.startswith("MEMORY_") and key not in ("MEMORY_ENABLED", "MEMORY_EMBED_TEXT_MODEL",
-                                                     "MEMORY_EMBED_IMAGE_MODEL"):
+                                                     "MEMORY_EMBED_IMAGE_MODEL",
+                                                     "MEMORY_DECISION_MODE"):
             os.environ.pop(key)
     for key, val in over.items():
         os.environ[key] = str(val)

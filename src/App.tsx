@@ -505,10 +505,22 @@ export default function App() {
   // Creation-time (locked while a session is live); each cloud option only
   // appears when the backend reports that lane (API key present at boot). When
   // one is selected, the voice select lists its voices (voice_id on the wire).
-  const [ttsEngine, setTtsEngine] = useState<'local' | 'elevenlabs' | 'minimax'>('local');
+  const [ttsEngine, setTtsEngine] = useState<'local' | 'elevenlabs' | 'minimax'>('minimax');
   const [cloudTts, setCloudTts] = useState<Partial<Record<'elevenlabs' | 'minimax', {
     ready: boolean; model?: string; voices: { voice_id: string; name: string }[];
   }>>>({});
+
+  // Engine may DEFAULT to a cloud lane (no onChange fires) — once that lane's
+  // voice registry lands, re-seat a stale voicePreset (e.g. the local 'Yuewen')
+  // to the lane's first voice, or the cloud API 2054s and the session is mute.
+  useEffect(() => {
+    if (ttsEngine === 'local') return;
+    const lane = cloudTts[ttsEngine];
+    if (!lane?.voices?.length) return;
+    if (!lane.voices.some((v) => v.voice_id === voicePreset)) {
+      setVoicePreset(lane.voices[0].voice_id);
+    }
+  }, [ttsEngine, cloudTts, voicePreset]);
 
   // New sidebar modal and search states (the scroll-rail position/index/drag
   // state lives inside each HistoryScrollRail instance)

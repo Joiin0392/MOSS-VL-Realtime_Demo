@@ -82,6 +82,11 @@ def _probe_via_smi(timeout_s: float) -> Optional[List[GpuInfo]]:
         )
     except FileNotFoundError:
         return None  # no nvidia-smi on PATH → try the torch child
+    except OSError as exc:
+        # e.g. Errno 8 Exec format error: a foreign-arch nvidia-smi stub on
+        # PATH (CPU-only box sharing mounts with GPU nodes) — same as absent.
+        log.warning("nvidia-smi not executable (%s) — treating as no GPUs", exc)
+        return None
     except subprocess.TimeoutExpired:
         log.error("nvidia-smi hung >%.0fs (wedged driver?) — treating as no GPUs", timeout_s)
         return []

@@ -138,6 +138,10 @@ class Orchestrator:
         self._rollover = rollover
         self._reseat_factory = reseat_factory
         self._reseat_in_progress = False
+        # failure relay (GATEWAY_PLAN P2): a dead VLM transport gets ONE memory
+        # -prefix re-seat attempt before the terminal state; reset on every
+        # successful reseat so a later death can relay again
+        self._failure_relay_attempted = False
         self._last_rollover_at = 0.0
         # worker's exact text-KV token count, cached off the 1 Hz vlm status
         # (None until the worker's token-counter patch reports one)
@@ -701,7 +705,7 @@ class Orchestrator:
             log.info("memory: recalled %d item(s) for %s", len(recall.ids), self.state.session_id)
         return recall
 
-    def _note_memory_turn(self, role: str, text: str) -> None:
+    def _note_memory_turn(self, role: str, text: str, *, commit: bool = True) -> None:
         if self.memory is None or not text:
             return
         try:
@@ -709,7 +713,9 @@ class Orchestrator:
             if role == "user":
                 self.memory.note_user_turn(text, media_ts=media_ts)
             else:
-                self.memory.note_assistant_turn(text, media_ts=media_ts)
+                # commit=False (barge-in / <|eot_id|> interrupted): the text stays
+                # as compact-journal context but never enters long-term memory
+                self.memory.note_assistant_turn(text, media_ts=media_ts, commit=commit)
         except Exception as exc:  # noqa: BLE001
             log.debug("memory note_turn failed: %s", exc)
 
@@ -748,6 +754,8 @@ class Orchestrator:
                 r.finalized = True
                 r.stop_reason = stop_reason
                 self.state.emit(p.RESPONSE_TEXT_DONE, response_id=r.response_id, text=r.text)
+                # the truncated half-answer stays as compact context, never stored
+                self._note_memory_turn("assistant", r.text, commit=False)
             else:
                 r.stop_reason = stop_reason
             self._complete_response(r)
@@ -906,7 +914,7 @@ class Orchestrator:
         r.finalized = True
         r.stop_reason = stop_reason
         self.state.emit(p.RESPONSE_TEXT_DONE, response_id=r.response_id, text=r.text)
-        self._note_memory_turn("assistant", r.text)
+        self._note_memory_turn("assistant", r.text, commit=(stop_reason != p.STOP_INTERRUPTED))
         self._schedule_memory_facts()
         self.metrics["last_response_chars"] = len(r.text)
         if self.engines.tts is not None and r.units_emitted > 0:
@@ -1163,6 +1171,35 @@ class Orchestrator:
         if self._vlm_dead:
             return
         self._vlm_dead = True
+        if (not self._closed
+                and not self._reseat_in_progress
+                and not self._failure_relay_attempted
+                and self._rollover is not None
+                and self._reseat_factory is not None
+                and self.memory is not None):
+            # GATEWAY_PLAN P2 failure relay: the transport died but the memory
+            # prefix can rebuild the conversation on a fresh engine — try that
+            # once before going terminal. _vlm_dead stays True during the relay,
+            # so push_frame keeps its silent-drop behaviour (the latest frame is
+            # still tracked for the re-push) and _user_turn keeps answering
+            # vlm_unavailable instead of feeding a dead engine.
+            self._failure_relay_attempted = True
+            log.warning("session %s: VLM died (%s); relaying onto a fresh engine "
+                        "with the memory prefix", self.state.session_id, message)
+            try:
+                task = asyncio.get_running_loop().create_task(
+                    self._reseat_vlm(trigger="failure"),
+                    name=f"orch-relay-{self.state.session_id[:12]}")
+            except Exception as exc:  # noqa: BLE001 — no running loop etc.
+                log.warning("failure relay could not be scheduled: %s", exc)
+            else:
+                self._tasks.append(task)
+                return
+        self._vlm_dead_final(message)
+
+    def _vlm_dead_final(self, message: str) -> None:
+        """Terminal dead state: relay disabled, already attempted, or failed."""
+        self._vlm_dead = True
         self._emit_error("vlm_stopped", message)
         self._finalize_response(p.STOP_ERROR)
 
@@ -1190,6 +1227,14 @@ class Orchestrator:
         tokens = self._last_text_tokens
         if tokens is None:
             return
+        try:
+            # compact prefetch rides ahead of both thresholds (pi provider):
+            # the seconds-long /compact is normally done by the time a rollover
+            # fires. Runs here = the 1 Hz status tick AND the <|silence|> idle
+            # point, the same hooks that evaluate should_rollover.
+            self._rollover.maybe_prefetch_compact(tokens)
+        except Exception as exc:  # noqa: BLE001
+            log.debug("rollover prefetch check failed: %s", exc)
         try:
             fire = self._rollover.should_rollover(tokens, idle=idle)
         except Exception as exc:  # noqa: BLE001
@@ -1270,14 +1315,20 @@ class Orchestrator:
             self.memory.note_rollover(kept_ids, text_tokens=float(est_tokens))
             self._last_text_tokens = float(est_tokens)
             self._last_rollover_at = time.monotonic()
+            # a successful reseat re-arms the failure relay: the NEXT transport
+            # death gets its own one-shot relay attempt
+            self._failure_relay_attempted = False
             self.metrics["rollovers"] = self.metrics.get("rollovers", 0) + 1
             log.info("rollover (%s) complete for %s", trigger, self.state.session_id)
         except Exception as exc:  # noqa: BLE001 — rollover must never kill a session
             log.exception("rollover reseat failed for %s: %s", self.state.session_id, exc)
-            if old_stopped:
-                # no old session to fall back to — surface the same terminal
-                # state a VLM crash would (today's behaviour without rollover)
-                self._mark_vlm_dead(f"rollover reseat failed: {exc}")
+            if old_stopped or self._vlm_dead:
+                # no old session to fall back to — the old engine was stopped
+                # for the capacity retry, or this reseat IS the failure relay
+                # (entered with _vlm_dead already set). Surface the same
+                # terminal state a VLM crash would (today's behaviour without
+                # rollover); _failure_relay_attempted guards against recursion.
+                self._vlm_dead_final(f"rollover reseat failed: {exc}")
         finally:
             self._reseat_in_progress = False
 

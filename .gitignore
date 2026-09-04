@@ -103,3 +103,9 @@ src/samp/sentences/*
 src/samp/videos/*
 !src/samp/videos/README.md
 hf_space/
+
+# crash dumps / local test artifacts
+core.*
+e2e_reply.wav
+# box-local TTS model symlinks (absolute paths into the board repo)
+server/adapters/tts/moss_tts_nano/sidecar/third_party/MOSS-TTS-Nano/models/
