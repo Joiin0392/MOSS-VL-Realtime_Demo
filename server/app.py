@@ -70,10 +70,20 @@ async def lifespan(app: FastAPI):
         runtime.vlm_supervisor = supervisor
         spawn_jobs.append(asyncio.to_thread(supervisor.spawn_all))  # spawn + health-gate
     vlm_offline = getattr(runtime, "vlm_offline", None)  # tests inject partial Runtimes
-    if vlm_offline is not None:
+    offline_provider = settings.offline_provider.strip().lower()
+    if vlm_offline is not None and offline_provider == "sglang":
         sglang_supervisor = SglangSidecarSupervisor(settings, plan, vlm_offline)
         runtime.sglang_supervisor = sglang_supervisor
         spawn_jobs.append(asyncio.to_thread(sglang_supervisor.spawn_all))
+    elif vlm_offline is not None and offline_provider == "hf" \
+            and getattr(plan, "offline", None):
+        def _load_offline_hf() -> None:
+            try:
+                vlm_offline.load(settings.offline_model_path,
+                                 plan.offline[0].gpu_index, "offline")
+            except Exception:  # noqa: BLE001
+                log.exception("Autoload offline HF VLM failed")
+        spawn_jobs.append(asyncio.to_thread(_load_offline_hf))
     if spawn_jobs:
         await asyncio.gather(*spawn_jobs)
     if supervisor is not None:
@@ -86,9 +96,10 @@ async def lifespan(app: FastAPI):
     await asyncio.to_thread(runtime.start_voice)
     await asyncio.to_thread(runtime.maybe_load_vlm)
     ops.start_loop_lag_gauge(app)
-    log.info("Backend ready (vlm capacity=%d, offline sglang=%d).",
+    log.info("Backend ready (vlm capacity=%d, offline %s=%s).",
              getattr(runtime.vlm, "capacity", 1),
-             getattr(vlm_offline, "capacity", 0) if vlm_offline else 0)
+             offline_provider or "none",
+             (getattr(vlm_offline, "capacity", 1) if vlm_offline else 0))
     try:
         yield
     finally:
