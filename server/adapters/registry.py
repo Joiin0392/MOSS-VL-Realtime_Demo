@@ -102,5 +102,14 @@ def build_vlm_offline(settings: Settings, plan: Optional[object] = None):
         from .vlm.moss_vl_sglang.adapter import SglangOfflinePool
 
         return SglangOfflinePool(settings, plan)
+    if provider == "hf":
+        # Same adapter class as the online pool: offline chat rides the plain
+        # offline_generate path (no realtime session), and the dedicated
+        # instance keeps chat isolated from the realtime plane's _infer_lock.
+        # Model weights load in the lifespan hook (app.py), pinned to the
+        # placement plan's offline GPU.
+        from .vlm.moss_vl_hf.adapter import HfMossVlAdapter
+
+        return HfMossVlAdapter(settings)
     raise NotImplementedError(
-        f"offline provider '{provider}' not implemented. Available: sglang, none.")
+        f"offline provider '{provider}' not implemented. Available: sglang, hf, none.")
