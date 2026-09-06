@@ -54,7 +54,10 @@ ws_limit=${WS_MAX_SIZE:-$((frame_limit * 2))}
 [[ "$ws_limit" =~ ^[1-9][0-9]*$ ]] || { echo "Invalid WS_MAX_SIZE" >&2; exit 1; }
 (( ws_limit > frame_limit )) || { echo "WS_MAX_SIZE must exceed GATEWAY_MAX_FRAME_BYTES" >&2; exit 1; }
 # uvloop (ships with uvicorn[standard]) keeps the WS plane snappy under load
-exec .venv/bin/python -m uvicorn server.app:app --host 127.0.0.1 --port "${PORT:-8000}" \
+# interpreter: .venv if built, else PYBIN from env (e.g. mamba python on NPU boxes)
+PYBIN="${PYBIN:-$REPO/.venv/bin/python}"
+[ -x "$PYBIN" ] || PYBIN="$(command -v python3 || echo python3)"
+exec "$PYBIN" -m uvicorn server.app:app --host 127.0.0.1 --port "${PORT:-8000}" \
   --loop "${UVICORN_LOOP:-uvloop}" \
   --ws-max-size "$ws_limit" \
   --ws-ping-interval "${WS_PING_INTERVAL:-20}" --ws-ping-timeout "${WS_PING_TIMEOUT:-20}"

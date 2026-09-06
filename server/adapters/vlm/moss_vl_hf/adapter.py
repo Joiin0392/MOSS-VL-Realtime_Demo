@@ -27,6 +27,16 @@ import torch
 
 from ....config import Settings
 from ....logging_conf import get_logger
+from ....device_compat import device_str
+from .serving_policy import (
+    auto_attn_impl,
+    clamp_attn_override,
+    launch_decode_worker,
+    offline_chat_attn_impl,
+    prepare_vision_prefill,
+    realtime_attn_impl,
+    run_processor,
+)
 from ....realtime.mossvl_patches import (
     DEFAULT_BOARD_REALTIME_SYSTEM_PROMPT,
     decode_prefill_messages,
@@ -146,43 +156,36 @@ class HfMossVlAdapter:
 
     @property
     def device(self) -> str:
-        return f"cuda:{self.gpu_id}"
+        return device_str(self.gpu_id)
 
     def _resolve_attn_impl(self, gpu_id: int, override: Optional[str]) -> str:
-        """Explicit override > explicit setting > auto by compute capability."""
-        from ....gpu.topology import select_attn_impl
+        """Explicit override > explicit setting > auto by backend."""
 
         if override and override.strip().lower() != "auto":
-            return override
-        cc = (0, 0)
-        try:
-            if torch.cuda.is_available():
-                cc = torch.cuda.get_device_capability(gpu_id)
-        except Exception:  # noqa: BLE001 — unknown cc → FA-first with sdpa fallback
-            pass
-        return select_attn_impl(cc, self.s.attn_impl)
+            return clamp_attn_override(override)
+        return auto_attn_impl(gpu_id, self.s.attn_impl)
 
     def load(self, model_path: str, gpu_id: int, hf_mode: str,
              attn_impl_override: Optional[str] = None) -> None:
         hf_mode = hf_mode if hf_mode in (HF_MODE_OFFLINE, HF_MODE_ONLINE_STREAMING) else HF_MODE_ONLINE_STREAMING
         self.gpu_id = gpu_id
         self._attn_impl = self._resolve_attn_impl(gpu_id, attn_impl_override)
-        device = f"cuda:{gpu_id}"
+        device = device_str(gpu_id)
         model_config = read_model_config(model_path)
         if not is_mossvl_model(model_config):
             raise RuntimeError(f"Expected a MOSS-VL checkpoint (model_type=moss_vl) at {model_path}")
 
         log.info("Loading MOSS-VL (%s) from %s to %s", hf_mode, model_path, device)
         if hf_mode == HF_MODE_ONLINE_STREAMING:
-            ModelClass, ConfigClass = resolve_streaming_mossvl_classes(self.s.mossvl_streaming_processor_path)
-            streaming_config = ConfigClass.from_pretrained(model_path)
+            from transformers import AutoModelForCausalLM, AutoConfig
+            streaming_config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
             ovr = self.s.vision_seq_pad_multiple_override
             if ovr is not None and getattr(streaming_config, "vision_seq_pad_multiple", None) != ovr:
                 log.warning("Overriding vision_seq_pad_multiple %s -> %s (validated realtime path is 1)",
                             getattr(streaming_config, "vision_seq_pad_multiple", None), ovr)
                 streaming_config.vision_seq_pad_multiple = ovr
             processor_path = self.s.mossvl_streaming_processor_path
-            model = self._from_pretrained(ModelClass, model_path, config=streaming_config)
+            model = self._from_pretrained(AutoModelForCausalLM, model_path, config=streaming_config)
         else:
             from transformers import AutoModelForCausalLM
             processor_path = model_path  # offline processor bundled with the ckpt (or canonical)
@@ -248,6 +251,9 @@ class HfMossVlAdapter:
             raise RuntimeError("Realtime requires hf_mode=online_streaming; reload the model")
         if not callable(getattr(self.model, "real_time_generate", None)):
             raise RuntimeError("Loaded MOSS-VL class does not expose real_time_generate")
+        # eager on NPU (SDPA decode hang); CUDA keeps its load-time impl — serving_policy
+        for cfg in self._attn_configs():
+            cfg._attn_implementation = realtime_attn_impl(cfg._attn_implementation)
 
     def start_realtime_session(
         self,
@@ -514,7 +520,17 @@ class HfMossVlAdapter:
         generated: list = []
         emitted = ""
         with torch.no_grad():
-            if vision:
+            if vision and "_prefill_outputs" in vision:
+                # Prefill was already run in the main thread (NPU thread safety)
+                outputs = vision["_prefill_outputs"]
+                # Same rope_delta contract as the elif branch below — the
+                # model's decode position is cache_index + delta (delta is
+                # NON-zero for vision prompts; measured 20 on a test image)
+                deltas = getattr(outputs, "rope_deltas", None)
+                if deltas is None:  # fall back to the module-level cache
+                    deltas = getattr(getattr(self.model, "model", None), "rope_deltas", None)
+                rope_delta = int(deltas.reshape(-1)[0].item()) if deltas is not None else 0
+            elif vision:
                 vision_kwargs = {
                     k: (v.to(device) if hasattr(v, "to") else v)
                     for k, v in vision.items()
@@ -715,45 +731,48 @@ class HfMossVlAdapter:
                 multi_image_max_pixels=params.multi_image_max_pixels,
                 video_max_pixels=params.video_max_pixels,
             )
-            # video decode (torchcodec) is blocking too — keep it off-loop
-            inputs = await asyncio.to_thread(
-                lambda: proxy(text=[text], images=images or None,
-                              videos=videos or None, return_tensors="pt"))
+            inputs = await run_processor(proxy, text, images, videos)
             input_ids = inputs["input_ids"]
             vision = {
                 key: inputs.get(key)
                 for key in ("pixel_values", "grid_thw", "cross_attention_mask", "media_nums_per_sample")
             }
+            attn_configs = self._attn_configs()
+            saved_impls = [(cfg, cfg._attn_implementation) for cfg in attn_configs]
+            vision, input_ids = prepare_vision_prefill(
+                self.model, self.device, input_ids, vision)
         else:
             text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
             input_ids = tokenizer(text, return_tensors="pt")["input_ids"]
+            attn_configs = self._attn_configs()
+            saved_impls = [(cfg, cfg._attn_implementation) for cfg in attn_configs]
 
-        attn_configs = self._attn_configs()
-        saved_impls = [(cfg, cfg._attn_implementation) for cfg in attn_configs]
+        # sdpa on CUDA (upstream: FA2 varlen misreads 3-D M-RoPE as packed
+        # batch), unchanged on NPU — serving_policy
         for cfg in attn_configs:
-            cfg._attn_implementation = "sdpa"
+            cfg._attn_implementation = offline_chat_attn_impl(cfg._attn_implementation)
 
         deltas: "queue_mod.Queue" = queue_mod.Queue()
-        worker_error: list = []
 
-        def _run():
+        loop = asyncio.get_running_loop()
+        decode_exc: list = []
+
+        def _decode():
             try:
                 self._offline_decode_loop(tokenizer, input_ids, params, deltas.put, vision=vision)
-            except BaseException as exc:  # noqa: BLE001 — surfaced to the SSE stream
-                worker_error.append(exc)
+            except BaseException as exc:
+                decode_exc.append(exc)
                 log.exception("offline generate failed: %s", exc)
             finally:
                 deltas.put(None)
 
-        thread = threading.Thread(target=_run, name="offline-chat", daemon=True)
-        thread.start()
-        loop = asyncio.get_running_loop()
+        worker = launch_decode_worker(loop, _decode)
         try:
             while True:
                 try:
                     delta = await loop.run_in_executor(None, deltas.get, True, 5.0)
                 except queue_mod.Empty:
-                    if thread.is_alive():
+                    if worker.still_running():
                         continue  # slow step on a contended GPU — keep waiting
                     break
                 if delta is None:
@@ -761,8 +780,8 @@ class HfMossVlAdapter:
                 if delta:
                     yield delta
         finally:
-            thread.join(timeout=2.0)
+            await worker.shutdown()
             for cfg, impl in saved_impls:
                 cfg._attn_implementation = impl
-        if worker_error:
-            raise RuntimeError(f"generation failed: {worker_error[0]}") from worker_error[0]
+        if decode_exc:
+            raise RuntimeError(f"generation failed: {decode_exc[0]}") from decode_exc[0]
