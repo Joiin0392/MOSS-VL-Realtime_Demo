@@ -23,6 +23,8 @@ unhealthy/quarantined.
 """
 from __future__ import annotations
 
+import json
+import math
 import threading
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
@@ -46,20 +48,29 @@ class GatewayCapacityError(RuntimeError):
         self.busy = busy
 
 
+class GatewayUnavailableError(ConnectionError):
+    """No reachable replica or the overall creation deadline was exceeded."""
+
+
 @dataclass
 class GatewayReplica:
     url: str
-    state: str = READY
+    state: str = DOWN  # Not routable until the first successful health probe.
     slots: int = 1            # sessions this replica may host (= omni --max-running-requests)
     used: int = 0             # slots held by live tracked sessions
     capacity_limited: bool = False  # omni reported session_capacity_exceeded;
                                     # the prober re-checks and clears the mark
     health: Dict[str, Any] = field(default_factory=dict)
+    health_epoch: int = 0
 
 
 class GatewayPool:
     def __init__(self, settings: Settings):
         self.s = settings
+        if settings.gateway_max_frame_bytes <= 0:
+            raise ValueError("GATEWAY_MAX_FRAME_BYTES must be positive")
+        if not math.isfinite(settings.gateway_create_timeout_s) or settings.gateway_create_timeout_s <= 0:
+            raise ValueError("GATEWAY_CREATE_TIMEOUT_S must be finite and positive")
         urls = [u.strip().rstrip("/")
                 for u in str(settings.sglang_omni_urls or "").split(",") if u.strip()]
         slots = max(1, int(settings.sglang_omni_sessions_per_replica or 1))
@@ -68,6 +79,15 @@ class GatewayPool:
         self._lock = threading.Lock()
         self._prober_stop = threading.Event()
         self._prober: Optional[threading.Thread] = None
+        versions = json.loads(settings.gateway_model_versions or "{}")
+        if not isinstance(versions, dict) or any(
+            not isinstance(url, str) or not isinstance(version, str) or not version.strip()
+            for url, version in versions.items()
+        ):
+            raise ValueError("GATEWAY_MODEL_VERSIONS must map replica URLs to non-empty version strings")
+        self._versions = {url.rstrip("/"): version.strip() for url, version in versions.items()}
+        if set(self._versions) - set(urls):
+            raise ValueError("GATEWAY_MODEL_VERSIONS contains an unconfigured replica URL")
 
     # ------------------------------------------------------------ introspection
 
@@ -85,6 +105,14 @@ class GatewayPool:
 
     def replica_url(self, index: int) -> str:
         return self._replicas[index].url
+
+    def replica_version(self, index: int) -> Optional[str]:
+        return self._versions.get(self.replica_url(index)) or self.s.gateway_model_version.strip() or None
+
+    def routable_replicas(self) -> list[tuple[int, str]]:
+        with self._lock:
+            return [(i, r.url) for state in (READY, BUSY)
+                    for i, r in enumerate(self._replicas) if r.state == state]
 
     def first_ready_url(self) -> Optional[str]:
         """First READY replica, else a BUSY one (a live session does not make a
@@ -116,12 +144,14 @@ class GatewayPool:
 
     # ------------------------------------------------------------ slots
 
-    def acquire(self) -> int:
+    def acquire(self, *, exclude: Optional[set[int]] = None) -> int:
         """Reserve a slot on the least-loaded READY replica (ties → lowest
         index); returns its index."""
         with self._lock:
             picked: Optional[int] = None
             for i, r in enumerate(self._replicas):
+                if exclude and i in exclude:
+                    continue
                 if r.state == READY and r.used < r.slots and (
                         picked is None or r.used < self._replicas[picked].used):
                     picked = i
@@ -145,6 +175,7 @@ class GatewayPool:
             r.used = max(0, r.used - 1)  # the rejected acquire held nothing
             r.capacity_limited = True
             r.state = BUSY
+            r.health_epoch += 1
         log.info("gateway replica %d (%s) at session capacity — marked full",
                  index, r.url)
 
@@ -155,19 +186,48 @@ class GatewayPool:
             r.capacity_limited = False  # a tracked slot drained — fullness may have eased
             # a dead transport means the server may be wedged — quarantine the
             # replica until the prober's next health poll clears it
-            r.state = DOWN if transport_dead else (READY if r.used < r.slots else BUSY)
+            if transport_dead:
+                r.state = DOWN
+                r.health_epoch += 1
+            elif r.state != DOWN:
+                r.state = READY if r.used < r.slots else BUSY
         log.info("gateway replica %d (%s) released%s", index, r.url,
                  " (transport dead — quarantined)" if transport_dead else "")
 
     # ------------------------------------------------------------ health
+
+    def mark_unhealthy(self, index: int) -> None:
+        with self._lock:
+            replica = self._replicas[index]
+            replica.state = DOWN
+            replica.health_epoch += 1
+
+    def probe_all(self) -> None:
+        for replica in self._replicas:
+            if self._prober_stop.is_set():
+                return
+            with self._lock:
+                epoch = replica.health_epoch
+            health = self._probe_health(replica.url)
+            with self._lock:
+                # A handshake failure/full mark after this probe started wins.
+                if epoch != replica.health_epoch:
+                    continue
+                replica.health = health or {}
+                if health is None:
+                    replica.state = DOWN
+                else:
+                    replica.capacity_limited = False
+                    replica.state = READY if replica.used < replica.slots else BUSY
 
     def _probe_health(self, url: str) -> Optional[Dict[str, Any]]:
         try:
             resp = requests.get(f"{url}/health",
                                 timeout=max(1.0, self.s.sglang_omni_connect_timeout_s))
             if resp.ok:
-                return resp.json() if resp.content else {"ok": True}
-        except requests.RequestException:
+                health = resp.json() if resp.content else {"ok": True}
+                return health if isinstance(health, dict) else None
+        except (requests.RequestException, ValueError):
             pass
         return None
 
@@ -177,28 +237,10 @@ class GatewayPool:
         interval = max(0.2, float(self.s.sglang_omni_health_interval_s))
 
         def prober() -> None:
-            while not self._prober_stop.wait(interval):
-                for i, r in enumerate(self._replicas):
-                    with self._lock:
-                        needs_probe = r.state == DOWN or r.capacity_limited
-                    if not needs_probe:
-                        continue
-                    health = self._probe_health(r.url)
-                    if health is None:
-                        continue
-                    with self._lock:
-                        r.health = health
-                        if r.state == DOWN:
-                            r.state = READY if r.used < r.slots else BUSY
-                            log.info("gateway replica %d recovered (%s)", i, r.url)
-                        elif r.capacity_limited:
-                            # server healthy again — the sessions that filled it
-                            # may have drained; a wrong clear self-corrects on
-                            # the next capacity rejection
-                            r.capacity_limited = False
-                            r.state = READY if r.used < r.slots else BUSY
-                            log.info("gateway replica %d capacity mark cleared (%s)",
-                                     i, r.url)
+            while not self._prober_stop.is_set():
+                self.probe_all()
+                if self._prober_stop.wait(interval):
+                    break
 
         self._prober = threading.Thread(
             target=prober, name="gateway-omni-health", daemon=True)
@@ -207,5 +249,5 @@ class GatewayPool:
     def close(self) -> None:
         self._prober_stop.set()
         if self._prober is not None:
-            self._prober.join(timeout=2.0)
+            self._prober.join(timeout=2 * max(1.0, self.s.sglang_omni_connect_timeout_s) + 1)
             self._prober = None

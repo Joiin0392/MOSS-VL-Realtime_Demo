@@ -32,9 +32,9 @@ Counters（单调递增）：
 
 | # | 规则 | 阈值 | 级别 | 含义 | 处置 |
 |---|---|---|---|---|---|
-| 1 | 副本不可用 | `gateway_replicas_down > 0` 持续 1min | **critical** | 有 omni 实例探活失败或被传输异常隔离，可用容量收缩 | 查实例进程/GPU；确认 prober 是否自动恢复（`sglang_omni_health_interval_s`）；不恢复则重启实例并按 P8 预案接力会话 |
+| 1 | 副本不可用 | `gateway_replicas_down > 0` 持续 1min | **critical** | 实例未通过启动/周期探活或被传输错误隔离，可用容量收缩 | 查实例进程/GPU与探活；恢复服务后由客户端新建会话，网关不做 memory 接力 |
 | 2 | 容量水位高 | `gateway_replica_slots_used / gateway_replica_slots_total > 0.8` 持续 5min | **warning** | 会话容量接近打满，新建会话将 503（session_capacity_exceeded） | 评估扩容（加实例/调 max_running_requests，需 P5 安全 N 内）；核对是否有泄漏会话（对照 `gateway_active_sessions` 与平台侧） |
-| 3 | 异常断连率突增 | `rate(gateway_abnormal_disconnects_total[5m]) > 0.1/s`（或 5min 增量 > 5） | **critical** | omni 传输成片死亡，会话被 1011 终结 | 与规则 1 联动：先查副本健康；查 omni 侧崩溃日志；确认是否触发 P2 故障接力 |
+| 3 | 异常断连率突增 | `rate(gateway_abnormal_disconnects_total[5m]) > 0.1/s`（或 5min 增量 > 5） | **critical** | omni 传输成片死亡，会话被 1011 终结 | 与规则 1 联动查日志；客户端重新 REST 建会话，不等待网关接力 |
 | 4 | attach 超时 | `increase(gateway_attach_timeouts_total[5m]) > 0` | **warning** | 平台建了会话但客户端没来连（token 过期/客户端失败/链路问题） | 查平台侧建连链路；偶发可忽略，持续出现查 `gateway_ws_token_ttl_s` 与 `gateway_attach_timeout_s` 配置 |
 | 5 | 错误码突增 | `rate(gateway_errors_total[5m])` 按 code 环比突增（如 >3x 基线） | **warning** | 某类错误集中爆发：透传码（response_failed 等）指向推理侧；网关码（ws_token_invalid 等）指向接入侧 | 按 code 分流：透传码查 omni，网关码查平台接入与 token 发放 |
 

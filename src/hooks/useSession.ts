@@ -44,7 +44,7 @@ export interface SessionUiConfig {
   topP?: number;
   topK?: number;
   /** Generation rate cap, tokens/SECOND (omni max_tokens_per_turn).
-   *  Creation-time only; undefined → server default (10). */
+   *  Creation-time only; undefined → server default (4). */
   maxTokensPerTurn?: number;
 }
 

@@ -279,6 +279,13 @@ class Settings:
         default_factory=lambda: _env_float("SGLANG_OMNI_INPUT_DROP_WAIT_SECONDS", 0.5))
     sglang_omni_connect_timeout_s: float = field(
         default_factory=lambda: _env_float("SGLANG_OMNI_CONNECT_TIMEOUT_S", 10.0))
+    # Older backends without negotiated usage need a conservative token budget.
+    sglang_omni_context_length: int = field(
+        default_factory=lambda: _env_int("SGLANG_OMNI_CONTEXT_LENGTH", 131072))
+    sglang_omni_fallback_frame_tokens: int = field(
+        default_factory=lambda: _env_int("SGLANG_OMNI_FALLBACK_FRAME_TOKENS", 2048))
+    sglang_omni_context_reserve_tokens: int = field(
+        default_factory=lambda: _env_int("SGLANG_OMNI_CONTEXT_RESERVE_TOKENS", 4096))
     # DOWN-replica re-probe cadence (capacity-exceeded quarantine / health recovery)
     sglang_omni_health_interval_s: float = field(
         default_factory=lambda: _env_float("SGLANG_OMNI_HEALTH_INTERVAL_S", 10.0))
@@ -293,7 +300,13 @@ class Settings:
     # omni only *advertises* max_frame_bytes (session.configured) without enforcing
     # it, so the gateway polices binary frame size itself (error + close 1009)
     gateway_max_frame_bytes: int = field(
-        default_factory=lambda: _env_int("GATEWAY_MAX_FRAME_BYTES", 8 * 1024 * 1024))
+        default_factory=lambda: _env_int("GATEWAY_MAX_FRAME_BYTES", 32 * 1024 * 1024))
+    gateway_create_timeout_s: float = field(
+        default_factory=lambda: _env_float("GATEWAY_CREATE_TIMEOUT_S", 30.0))
+    gateway_model_version: str = field(
+        default_factory=lambda: _env("GATEWAY_MODEL_VERSION", ""))
+    gateway_model_versions: str = field(
+        default_factory=lambda: _env("GATEWAY_MODEL_VERSIONS", "{}"))
     # per-session reconciliation ledger (P3): one JSONL record per session
     # teardown; "" → {data_dir}/gateway_usage.jsonl
     gateway_usage_log: str = field(default_factory=lambda: _env("GATEWAY_USAGE_LOG", ""))
@@ -387,9 +400,9 @@ class Settings:
     # max_tokens_per_turn is a tokens-per-SECOND pacing knob in real_time_generate
     # (wait = 1/N - cost). Unthrottled (86400) the model free-runs narration
     # rounds, starving ASR/prefill on a single shared GPU and ballooning the KV.
-    # 10 tok/s ≈ 1.5x speech — keeps the box responsive; per-session override
+    # 4 tok/s keeps long sessions light on KV/ASR starvation; per-session override
     # rides GenerationParams.max_tokens_per_turn (frontend streaming panel).
-    max_tokens_per_turn: int = field(default_factory=lambda: _env_int("GEN_MAX_TOKENS_PER_TURN", 10))
+    max_tokens_per_turn: int = field(default_factory=lambda: _env_int("GEN_MAX_TOKENS_PER_TURN", 4))
     frame_queue_size: int = field(default_factory=lambda: _env_int("FRAME_QUEUE_SIZE", 256))
     system_prompt: Optional[str] = field(default_factory=lambda: os.getenv("REALTIME_SYSTEM_PROMPT"))
     initial_prompt: str = field(default_factory=lambda: _env("REALTIME_INITIAL_PROMPT", ""))

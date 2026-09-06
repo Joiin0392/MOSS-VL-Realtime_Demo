@@ -124,17 +124,23 @@ class _PooledSession:
         self._index = index
         self._inner = inner
         self.session_id = inner.session_id
+        self._stop_lock = threading.Lock()
+        self._released = False
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._inner, name)
 
     def stop(self, timeout_seconds: float = 10.0) -> Dict[str, Any]:
-        try:
-            return self._inner.stop(timeout_seconds)
-        finally:
-            self._pool._release(
-                self._index, session=self._inner,
-                transport_dead=getattr(self._inner, "worker_transport_dead", False))
+        with self._stop_lock:
+            if self._released:
+                return {**self._inner.status(), "stopped": True}
+            try:
+                return self._inner.stop(timeout_seconds)
+            finally:
+                self._pool._release(
+                    self._index, session=self._inner,
+                    transport_dead=getattr(self._inner, "worker_transport_dead", False))
+                self._released = True
 
 
 class SglangOmniPool:
@@ -214,16 +220,21 @@ class SglangOmniPool:
         """Blocking (called via to_thread). The least-loaded READY replica wins
         (fewest used slots; ties → lowest index)."""
         retried_after_grace = False
+        attempted: set[int] = set()
+        last_error: Optional[Exception] = None
         while True:
             with self._lock:
                 picked: Optional[int] = None
                 for i, r in enumerate(self._replicas):
-                    if r.state == READY and (
+                    if i not in attempted and r.state == READY and (
                             picked is None or r.used < self._replicas[picked].used):
                         picked = i
                 if picked is None:
+                    if last_error is not None:
+                        raise ConnectionError("no reachable sglang-omni replica") from last_error
                     raise NoFreeReplica(self.capacity, self.busy)
                 r = self._replicas[picked]
+                attempted.add(picked)
                 r.used += 1  # reserve a slot before the (slow) WS handshake
                 if r.used >= r.slots:
                     r.state = BUSY
@@ -238,7 +249,8 @@ class SglangOmniPool:
                 with self._lock:
                     r.used = r.slots
                     r.state = BUSY
-                    any_ready = any(x.state == READY for x in self._replicas)
+                    any_ready = any(i not in attempted and x.state == READY
+                                    for i, x in enumerate(self._replicas))
                 if any_ready:
                     continue
                 if retried_after_grace:
@@ -246,6 +258,7 @@ class SglangOmniPool:
                 # every replica capacity-rejected us: a session in teardown
                 # frees its slot within seconds — one grace + one retry
                 retried_after_grace = True
+                attempted.clear()
                 log.warning("all sglang-omni replicas at session capacity — "
                             "retrying in %.0fs", self.capacity_retry_delay_s)
                 time.sleep(self.capacity_retry_delay_s)
@@ -257,12 +270,15 @@ class SglangOmniPool:
                             if x.used < x.slots:
                                 x.state = READY
                 continue
-            except Exception:
+            except Exception as exc:
                 with self._lock:
                     r.used = max(len(r.sessions), r.used - 1)  # hand the slot back
-                    if r.state == BUSY and r.used < r.slots:
-                        r.state = READY
-                raise
+                    r.state = (READY if r.used < r.slots else BUSY) if isinstance(exc, ValueError) else DOWN
+                if isinstance(exc, ValueError):
+                    raise
+                last_error = exc
+                log.warning("sglang-omni replica %d handshake failed; trying another: %s", picked, exc)
+                continue
             session = _PooledSession(self, picked, inner)
             with self._lock:
                 r.sessions.add(inner)
@@ -283,6 +299,9 @@ class SglangOmniPool:
                 client, created,
                 input_queue_capacity=self.s.sglang_omni_input_queue_capacity,
                 input_drop_wait_seconds=self.s.sglang_omni_input_drop_wait_seconds,
+                fallback_context_length=self.s.sglang_omni_context_length,
+                fallback_frame_tokens=self.s.sglang_omni_fallback_frame_tokens,
+                context_reserve_tokens=self.s.sglang_omni_context_reserve_tokens,
                 model_path=self.s.model_path)
             session.configure(payload, CONFIGURE_TIMEOUT_S)
             return session

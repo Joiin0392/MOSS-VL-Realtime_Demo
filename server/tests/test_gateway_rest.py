@@ -60,7 +60,8 @@ class Rig:
         self.pool.close()
 
 
-async def start_gateway(fake: GatewayFakeOmni, **overrides: Any) -> Rig:
+async def start_gateway(fake: GatewayFakeOmni, *, ws_max_size: int = 64 * 1024 * 1024,
+                        **overrides: Any) -> Rig:
     kwargs = dict(
         sglang_omni_urls=fake.url,
         sglang_omni_connect_timeout_s=5.0,
@@ -69,6 +70,7 @@ async def start_gateway(fake: GatewayFakeOmni, **overrides: Any) -> Rig:
     kwargs.update(overrides)
     settings = Settings(**kwargs)
     pool = GatewayPool(settings)
+    await asyncio.to_thread(pool.probe_all)
     tokens = TokenIssuer(settings.gateway_ws_token_ttl_s)
     registry = GatewayRegistry(settings, pool, tokens)
     app = FastAPI(title="gateway-plane-test")
@@ -79,6 +81,7 @@ async def start_gateway(fake: GatewayFakeOmni, **overrides: Any) -> Rig:
     app.state.gateway_tokens = tokens
 
     config = uvicorn.Config(app, host="127.0.0.1", port=0,
+                            ws_max_size=ws_max_size,
                             log_level="warning", lifespan="off")
     server = uvicorn.Server(config)
     task = asyncio.create_task(server.serve())

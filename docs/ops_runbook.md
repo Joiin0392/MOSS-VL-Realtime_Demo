@@ -31,7 +31,7 @@ CPU 节点转发入口（不承担任何服务进程）：
 要点：
 
 - gateway 与 omni 实例同 GPU 节点；**一期单副本**（GATEWAY_PLAN §0），gateway 重启 = 会话全断。
-- 本层只做会话管理、路由、透传、计量、保活、故障接力；客户侧鉴权/额度/限流/白名单一律平台发。
+- 薄网关只做会话管理、路由、透传、计量、保活；客户鉴权/额度/限流/白名单由平台负责。故障 memory 接力仅属于 Demo 平面。最新限制与配置见 [网关契约](gateway_contract.md)。
 - `start_demo.sh` / `stop_demo.sh` **只能在 GPU 节点执行**（脚本自检 `nvidia-smi`，CPU 节点直接拒绝）。
 
 ## 2. 启动 / 停止 / 状态
@@ -138,7 +138,7 @@ curl -s http://127.0.0.1:8100/api/status           # demo 平面状态
     副本被 `release(transport_dead=True)` 隔离为 DOWN，prober 按
     `SGLANG_OMNI_HEALTH_INTERVAL_S`（默认 10s）周期重探，`/health` 恢复即自动解除隔离。
 - **人工处置**：看 `logs/sglang_omni/omni_gpu{gpu}_p{port}.log` 定位死因；重启实例
-  （重跑 `./start_demo.sh`，健康门会只拉起死掉的实例）。若会话侧接力未生效，按 P2 验收口径排查。
+  （重跑 `./start_demo.sh`，健康门会只拉起死掉的实例）。网关客户端需重新建会话；仅 Demo 的会话接力按 Demo 验收口径排查。
 - **客户端影响**：demo 平面基本无感（接力期间有停顿）；透传平面收到 1011，需走
   REST 重建会话（新建 → 拿新 ws_token → 重新 attach）。
 
@@ -153,6 +153,8 @@ curl -s http://127.0.0.1:8100/api/status           # demo 平面状态
   注意 restart api 会同时断 demo 平面。
 
 ### 4.3 4B 后端宕机（:38090）
+
+本节仅影响 Demo memory 链路；薄网关 `/v1/realtime` 不依赖 4B 摘要/记忆编排。
 
 - **现象**：`curl http://127.0.0.1:38090/health` 不通；memory decide/compact 全部失败。
 - **自动行为**：memory 子系统降级 —— **会话继续，但无记忆能力**（decide/compact 调用失败被吞，

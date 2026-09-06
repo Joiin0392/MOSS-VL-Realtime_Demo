@@ -47,7 +47,14 @@ export MOSS_LOG_FILE="${MOSS_LOG_FILE:-$REPO/logs/handler/backend/backend.log}"
 export PYTHONUNBUFFERED=1
 
 cd "$REPO"
+# Leave room above the application limit to emit an error before close 1009.
+frame_limit=${GATEWAY_MAX_FRAME_BYTES:-33554432}
+[[ "$frame_limit" =~ ^[1-9][0-9]*$ ]] || { echo "Invalid GATEWAY_MAX_FRAME_BYTES" >&2; exit 1; }
+ws_limit=${WS_MAX_SIZE:-$((frame_limit * 2))}
+[[ "$ws_limit" =~ ^[1-9][0-9]*$ ]] || { echo "Invalid WS_MAX_SIZE" >&2; exit 1; }
+(( ws_limit > frame_limit )) || { echo "WS_MAX_SIZE must exceed GATEWAY_MAX_FRAME_BYTES" >&2; exit 1; }
 # uvloop (ships with uvicorn[standard]) keeps the WS plane snappy under load
 exec .venv/bin/python -m uvicorn server.app:app --host 127.0.0.1 --port "${PORT:-8000}" \
   --loop "${UVICORN_LOOP:-uvloop}" \
+  --ws-max-size "$ws_limit" \
   --ws-ping-interval "${WS_PING_INTERVAL:-20}" --ws-ping-timeout "${WS_PING_TIMEOUT:-20}"

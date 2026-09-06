@@ -217,8 +217,7 @@ class FakeSglangOmniServer:
         code = self._reject_next_input
         self._reject_next_input = None
         await ws.send(json.dumps({
-            "type": "error", "code": code, "message": f"fake rejection ({code})",
-            "seq_no": message["seq_no"]}))
+            "type": "error", "code": code, "message": f"fake rejection ({code})"}))
         return True
 
     # ---- scripting helpers (test thread → server loop) ----
@@ -415,7 +414,7 @@ def test_invalid_request_rolls_back_seq() -> None:
         server.reject_next_input("invalid_request")
         try:
             session.put_prompt("这条会被拒")
-        except RuntimeError as exc:
+        except (RuntimeError, ValueError) as exc:
             assert "invalid_request" in str(exc)
         else:
             raise AssertionError("rejected input must raise")

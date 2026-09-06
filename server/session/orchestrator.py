@@ -23,6 +23,7 @@ from __future__ import annotations
 import asyncio
 import itertools
 import json
+import math
 import re
 import sys
 import time
@@ -138,6 +139,8 @@ class Orchestrator:
         self._rollover = rollover
         self._reseat_factory = reseat_factory
         self._reseat_in_progress = False
+        self._reseat_lock = asyncio.Lock()
+        self._reseat_task: Optional[asyncio.Task] = None
         # failure relay (GATEWAY_PLAN P2): a dead VLM transport gets ONE memory
         # -prefix re-seat attempt before the terminal state; reset on every
         # successful reseat so a later death can relay again
@@ -288,6 +291,15 @@ class Orchestrator:
         if not looks_like_jpeg(jpeg):
             self._emit_error("bad_frame", "frame payload is not a JPEG")
             return
+        if timestamp is not None:
+            try:
+                timestamp = float(timestamp)
+            except (TypeError, ValueError):
+                self._emit_error("bad_frame", "timestamp must be finite and non-negative")
+                return
+            if not math.isfinite(timestamp) or timestamp < 0:
+                self._emit_error("bad_frame", "timestamp must be finite and non-negative")
+                return
         self._latest_frame = (jpeg, timestamp, time.monotonic())
         if self.memory is not None:
             try:
@@ -296,7 +308,7 @@ class Orchestrator:
                                        media_ts=self._media_ts_fields().get("media_ts"))
             except Exception as exc:  # noqa: BLE001
                 log.debug("memory note_frame failed: %s", exc)
-        if self._vlm_dead:
+        if self._vlm_dead or self._reseat_in_progress:
             return
         # Board parity: frames stream to the model continuously — even
         # mid-generation, where the loop splices their vision tokens into the
@@ -304,8 +316,13 @@ class Orchestrator:
         # queue's drop-oldest-pure-frame policy; user turns still clear stale
         # queued frames via put_prompt_frame(drop_pending=True).
         try:
-            await asyncio.to_thread(self.engines.vlm.put_frame, jpeg, timestamp, len(jpeg))
-            self.metrics["frames_forwarded"] += 1
+            status = await asyncio.to_thread(self.engines.vlm.put_frame, jpeg, timestamp, len(jpeg))
+            if not (status or {}).get("frame_dropped"):
+                self.metrics["frames_forwarded"] += 1
+            if (status or {}).get("context", {}).get("rollover_required"):
+                self._maybe_rollover(idle=False)
+        except ValueError as exc:
+            self._emit_error("bad_frame", str(exc))
         except Exception as exc:  # noqa: BLE001
             self._mark_vlm_dead(f"put_frame failed: {exc}")
 
@@ -641,6 +658,11 @@ class Orchestrator:
     async def _user_turn(self, text: str) -> None:
         if self._any_response_live():
             await self._cancel_response(p.STOP_INTERRUPTED)
+        try:
+            await self._ensure_context_room()
+        except Exception as exc:
+            self._mark_vlm_dead(f"context rollover failed: {exc}")
+            return
         self._segmenter.reset()
         self.metrics["turns"] += 1
         self._pending_turn_t0 = time.monotonic()
@@ -665,15 +687,26 @@ class Orchestrator:
         latest = self._latest_frame
         if latest is not None and (time.monotonic() - latest[2]) <= self.settings.frame_max_age_s:
             frame = latest
-        try:
-            if frame is not None:
-                # drop_pending=True clears stale queued pure frames (§1C keep-latest)
-                await asyncio.to_thread(
-                    self.engines.vlm.put_prompt_frame, vlm_text, frame[0], frame[1], len(frame[0]), True)
-            else:
-                await asyncio.to_thread(self.engines.vlm.put_prompt, vlm_text)
-        except Exception as exc:  # noqa: BLE001
-            self._mark_vlm_dead(f"prompt failed: {exc}")
+        for attempt in range(2):
+            try:
+                if frame is not None:
+                    await asyncio.to_thread(
+                        self.engines.vlm.put_prompt_frame, vlm_text, frame[0], frame[1], len(frame[0]), True)
+                else:
+                    await asyncio.to_thread(self.engines.vlm.put_prompt, vlm_text)
+                break
+            except Exception as exc:
+                if type(exc).__name__ == "ContextRolloverRequired" and attempt == 0:
+                    try:
+                        await self._ensure_context_room()
+                    except Exception as rollover_exc:
+                        self._mark_vlm_dead(f"context rollover failed: {rollover_exc}")
+                        return
+                    continue
+                if isinstance(exc, ValueError):
+                    self._emit_error("invalid_input", str(exc))
+                else:
+                    self._mark_vlm_dead(f"prompt failed: {exc}")
 
     async def _recall_for_turn(self, text: str):
         """Retrieve → gate → format, off the event loop. Never raises."""
@@ -762,8 +795,11 @@ class Orchestrator:
         if was_generating and not self._vlm_dead:
             self._drop_model_tail = True
             try:
-                # soft interrupt: injects <|eot_id|>, keeps the KV cache warm
-                await asyncio.to_thread(self.engines.vlm.request_turn_end)
+                if getattr(self.engines.vlm, "turn_interrupt_is_local", False):
+                    # Atomic with the UI cancellation: invalidate already-polled tails.
+                    self.engines.vlm.request_turn_end()
+                else:
+                    await asyncio.to_thread(self.engines.vlm.request_turn_end)
             except Exception as exc:  # noqa: BLE001
                 log.warning("request_turn_end failed for %s: %s", self.state.session_id, exc)
 
@@ -773,7 +809,8 @@ class Orchestrator:
         errors = 0
         while not self._vlm_dead:
             try:
-                batch = await asyncio.to_thread(self.engines.vlm.poll_output, 0.25, 128)
+                engine = self.engines.vlm
+                batch = await asyncio.to_thread(engine.poll_output, 0.25, 128)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001
@@ -783,13 +820,20 @@ class Orchestrator:
                 await asyncio.sleep(1.0)
                 continue
             errors = 0
+            if engine is not self.engines.vlm:
+                continue
             for ev in batch.chunk_events:
+                is_current = getattr(engine, "output_event_is_current", None)
+                if callable(is_current) and not is_current(ev):
+                    continue
                 emitted_at = ev.get("emitted_at")
                 self._route_model_text(
                     str(ev.get("text") or ""),
                     float(emitted_at) if isinstance(emitted_at, (int, float)) else None,
                 )
             if not batch.active:
+                if self._reseat_in_progress:
+                    return
                 self._mark_vlm_dead("the realtime model loop exited")
                 return
 
@@ -808,6 +852,8 @@ class Orchestrator:
 
     def _handle_control_token(self, token: str) -> None:
         if token == ROUND_START:
+            if self._drop_model_tail and getattr(self.engines.vlm, "turn_interrupt_is_local", False):
+                return
             self._drop_model_tail = False  # an explicit round always speaks
             self._open_response()
         elif token in SILENCE_TOKENS:
@@ -1158,6 +1204,7 @@ class Orchestrator:
             # local probe (no-op unless torch is already imported)
             "gpu": vlm_status.get("gpu") or _gpu_snapshot(),
             "kv": vlm_status.get("kv"),
+            "context": vlm_status.get("context"),
             "vlm": {k: vlm_status.get(k) for k in
                     ("frames_received", "frames_consumed", "frames_dropped", "outputs_emitted",
                      "text_tokens")},
@@ -1193,6 +1240,7 @@ class Orchestrator:
             except Exception as exc:  # noqa: BLE001 — no running loop etc.
                 log.warning("failure relay could not be scheduled: %s", exc)
             else:
+                self._reseat_task = task
                 self._tasks.append(task)
                 return
         self._vlm_dead_final(message)
@@ -1204,6 +1252,23 @@ class Orchestrator:
         self._finalize_response(p.STOP_ERROR)
 
     # ------------------------------------------------------------------ rollover (design §6)
+
+    def _context_requires_rollover(self) -> bool:
+        try:
+            return bool(self.engines.vlm.status().get("context", {}).get("rollover_required"))
+        except Exception:
+            return False
+
+    async def _ensure_context_room(self) -> None:
+        task = self._reseat_task
+        if task is not None and not task.done() and task is not asyncio.current_task():
+            await asyncio.shield(task)
+        if self._context_requires_rollover():
+            if self._rollover is None or self._reseat_factory is None or self.memory is None:
+                raise RuntimeError("context exhausted; memory rollover is not configured")
+            await self._reseat_vlm(trigger="context")
+            if self._vlm_dead or self._context_requires_rollover():
+                raise RuntimeError("replacement context is unavailable or its prefix is too large")
 
     def _vlm_generating(self) -> bool:
         """A response the model is still WRITING (TTS draining a finalized one
@@ -1218,14 +1283,20 @@ class Orchestrator:
         """
         if self._closed or self._reseat_in_progress or self._vlm_dead:
             return
-        if self._rollover is None or self._reseat_factory is None or self.memory is None:
-            return  # rollover inert: no manager, no factory, or no memory
-        if time.monotonic() - self._last_rollover_at < ROLLOVER_COOLDOWN_S:
+        if self._reseat_task is not None and not self._reseat_task.done():
             return
-        if self._vlm_generating():
+        context_limit = self._context_requires_rollover()
+        if self._rollover is None or self._reseat_factory is None or self.memory is None:
+            if context_limit:
+                self._mark_vlm_dead("context exhausted; memory rollover is not configured")
+                self._tasks.append(asyncio.create_task(asyncio.to_thread(self.engines.vlm.stop, 5.0)))
+            return  # rollover inert: no manager, no factory, or no memory
+        if not context_limit and time.monotonic() - self._last_rollover_at < ROLLOVER_COOLDOWN_S:
+            return
+        if not context_limit and self._vlm_generating():
             return
         tokens = self._last_text_tokens
-        if tokens is None:
+        if tokens is None and not context_limit:
             return
         try:
             # compact prefetch rides ahead of both thresholds (pi provider):
@@ -1236,16 +1307,17 @@ class Orchestrator:
         except Exception as exc:  # noqa: BLE001
             log.debug("rollover prefetch check failed: %s", exc)
         try:
-            fire = self._rollover.should_rollover(tokens, idle=idle)
+            fire = context_limit or self._rollover.should_rollover(tokens, idle=idle)
         except Exception as exc:  # noqa: BLE001
             log.debug("rollover check failed: %s", exc)
             return
         if not fire:
             return
         task = asyncio.get_running_loop().create_task(
-            self._reseat_vlm(trigger="idle" if idle else "hard"),
+            self._reseat_vlm(trigger="context" if context_limit else "idle" if idle else "hard"),
             name=f"orch-reseat-{self.state.session_id[:12]}")
         self._tasks.append(task)
+        self._reseat_task = task
 
     async def _call_reseat_factory(self, prefill_json: str) -> Any:
         """The factory may be sync or async (tests inject plain callables)."""
@@ -1255,10 +1327,28 @@ class Orchestrator:
             system_prompt=self.state.config.system_prompt,
             prefill_messages=prefill_json)
         if asyncio.iscoroutine(result) or isinstance(result, Awaitable):
-            return await result
+            opening = asyncio.ensure_future(result)
+            try:
+                return await asyncio.shield(opening)
+            except asyncio.CancelledError:
+                # to_thread handshakes cannot be cancelled; reclaim a late lease.
+                try:
+                    late_session = await opening
+                except Exception:
+                    pass
+                else:
+                    await asyncio.to_thread(late_session.stop, 5.0)
+                raise
         return result
 
     async def _reseat_vlm(self, *, trigger: str) -> None:
+        expected = self.engines.vlm
+        async with self._reseat_lock:
+            if self.engines.vlm is not expected or self._closed:
+                return
+            await self._perform_reseat_vlm(trigger=trigger)
+
+    async def _perform_reseat_vlm(self, *, trigger: str) -> None:
         """Rebuild the prefix and swap the VLM realtime session underneath the
         running conversation. Ordering invariants:
 
@@ -1274,22 +1364,30 @@ class Orchestrator:
         self._reseat_in_progress = True
         old = self.engines.vlm
         old_stopped = False
+        new = None
         try:
+            if trigger == "context":
+                # Hard budget: stop growth while rebuilding the memory prefix.
+                await self._cancel_response(p.STOP_INTERRUPTED)
+                old_stopped = True
+                await asyncio.to_thread(old.stop, 5.0)
             prefill, kept_ids, est_tokens = await self._rollover.build_prefix()
             prefill_json = json.dumps(prefill, ensure_ascii=False)
             log.info("rollover (%s) for %s: prefix ~%d est tokens, %d kept items, %d messages",
                      trigger, self.state.session_id, est_tokens, len(kept_ids), len(prefill))
-            new = None
             try:
                 new = await self._call_reseat_factory(prefill_json)
             except Exception as exc:  # noqa: BLE001 — classified below
                 capacity_conflict = type(exc).__name__ == "NoFreeReplica" or "already running" in str(exc)
-                if not capacity_conflict:
+                if not capacity_conflict or old_stopped:
                     raise  # old session still running — degrade to pre-rollover behaviour
                 log.info("rollover reseat: no free replica; stopping the old engine first")
                 old_stopped = True
                 await asyncio.to_thread(old.stop, 5.0)
                 new = await self._call_reseat_factory(prefill_json)
+            if self._closed:
+                await asyncio.to_thread(new.stop, 5.0)
+                return
             if not old_stopped:
                 try:
                     await asyncio.to_thread(old.stop, 5.0)
@@ -1297,6 +1395,7 @@ class Orchestrator:
                     log.warning("rollover: old VLM session stop failed", exc_info=True)
             self.engines.vlm = new
             self._vlm_dead = False
+            self._drop_model_tail = False
             # the drain loop exits on _vlm_dead or a dead batch; a reseat must
             # hand the NEW engine a fresh task either way
             task = self._vlm_drain_task
@@ -1320,6 +1419,10 @@ class Orchestrator:
             self._failure_relay_attempted = False
             self.metrics["rollovers"] = self.metrics.get("rollovers", 0) + 1
             log.info("rollover (%s) complete for %s", trigger, self.state.session_id)
+        except asyncio.CancelledError:
+            if new is not None and self.engines.vlm is not new:
+                await asyncio.to_thread(new.stop, 5.0)
+            raise
         except Exception as exc:  # noqa: BLE001 — rollover must never kill a session
             log.exception("rollover reseat failed for %s: %s", self.state.session_id, exc)
             if old_stopped or self._vlm_dead:

@@ -30,6 +30,10 @@ class SessionCapacityExceeded(RuntimeError):
     """The server rejected the session at accept time (close code 1013)."""
 
 
+class SessionConfigurationError(ValueError):
+    """Invalid session configuration; retrying another replica cannot fix it."""
+
+
 def http_to_ws_url(base_url: str) -> str:
     """Derive the realtime WS endpoint from a replica's http(s) base URL."""
     url = base_url.strip().rstrip("/")
@@ -72,19 +76,24 @@ class SglangOmniClient:
         """Connect and consume the mandatory first event (`session.created`)."""
         import websocket  # websocket-client (sync API)
 
+        deadline = time.monotonic() + 2 * self.connect_timeout_s
         self._ws = websocket.create_connection(
             self.ws_url, timeout=self.connect_timeout_s, enable_multithread=True)
         self._last_seen = time.monotonic()
-        first = self._recv_event()
+        try:
+            first = self._recv_event(deadline=deadline)
+        except BaseException:
+            self.abort_transport()
+            raise
         if first.get("type") == "error":
             if first.get("code") == "session_capacity_exceeded":
-                self.close()
+                self.abort_transport()
                 raise SessionCapacityExceeded(
                     str(first.get("message") or "session capacity exceeded"))
-            self.close()
+            self.abort_transport()
             raise RuntimeError(str(first.get("message") or "sglang-omni rejected the session"))
         if first.get("type") != "session.created":
-            self.close()
+            self.abort_transport()
             raise RuntimeError(f"expected session.created, got: {first}")
         return first
 
@@ -113,6 +122,8 @@ class SglangOmniClient:
             elif event_type == "session.ready":
                 ready = True
             elif event_type == "error":
+                if message.get("code") == "invalid_request":
+                    raise SessionConfigurationError(str(message.get("message") or "invalid configuration"))
                 raise RuntimeError(
                     str(message.get("message") or "sglang-omni session.configure failed"))
             else:
@@ -247,8 +258,23 @@ class SglangOmniClient:
             raise RuntimeError("non-object event from sglang-omni")
         return raw, message
 
-    def _recv_event(self) -> Dict[str, Any]:
+    def abort_transport(self) -> None:
+        """Close a failed handshake without waiting on the peer's close reply."""
+        self._closed.set()
+        try:
+            if self._ws is not None:
+                self._ws.abort()
+        except Exception:
+            pass
+        self.close()
+
+    def _recv_event(self, deadline: Optional[float] = None) -> Dict[str, Any]:
         while True:
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("sglang-omni handshake deadline exceeded")
+                self._ws.settimeout(min(self.connect_timeout_s, remaining))
             got = self._recv_message()
             if got is not None:
                 return got[1]

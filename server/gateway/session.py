@@ -9,14 +9,10 @@ Lifecycle (GATEWAY_PLAN.md §2-P1):
   destroys the session (this plane has NO grace/reconnect: omni cannot resume
   a session, so a client disconnect is final).
 
-Passthrough discipline: client→omni text frames and omni→client events cross
-as raw text, never re-serialized (SglangOmniClient.start_receiver(pass_raw=True)
-/ send_text). State tracking for GET /v1/realtime/sessions/{id} parses its own
-copy of each event and never touches the forwarded bytes.
-
-Frame-size policing lives here because omni only *advertises* max_frame_bytes
-(in session.configured) without enforcing it: an inbound binary frame over
-settings.gateway_max_frame_bytes gets error{code:invalid_request} + close 1009.
+Passthrough discipline: data frames cross verbatim, except session.created
+adds model-version metadata and session.configured publishes the effective
+minimum of gateway/backend frame limits. Oversize binary inputs receive
+error{code:invalid_request} + close 1009 within the transport receive bound.
 """
 from __future__ import annotations
 
@@ -38,7 +34,7 @@ from .metrics import (
     COUNTER_FRAMES_ACCEPTED, COUNTER_SESSIONS_CREATED, COUNTER_TEXT_CHARS,
     END_ATTACH_TIMEOUT, END_CLIENT_DISCONNECT, END_OMNI_DEAD, END_RESET,
     END_SESSION_DONE, END_SHUTDOWN, GAUGE_ACTIVE_SESSIONS, GatewayMetrics, UsageLog)
-from .pool import GatewayCapacityError, GatewayPool
+from .pool import GatewayCapacityError, GatewayPool, GatewayUnavailableError
 from .tokens import TokenIssuer
 
 log = get_logger(__name__)
@@ -66,6 +62,8 @@ class GatewaySession:
         self.created_at = time.time()
         self.request_id: Optional[str] = None
         self.model: Optional[str] = None
+        self.model_version: Optional[str] = None
+        self.model_version_source = "unknown"
 
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._index = -1                    # pool replica index
@@ -74,8 +72,14 @@ class GatewaySession:
         self._epoch = 0                     # bumped by reset(); stale receivers/pumps no-op
         self._ws_close_code = WS_CLOSE_NORMAL
         self._lock = threading.Lock()       # guards tracker + attached/destroyed flags
+        self._lifecycle_lock = asyncio.Lock()
         self._attached = False
         self._destroyed = False
+        self._resetting = False
+        self._owns_slot = False
+        self._open_deadline: Optional[float] = None
+        self._opening_cleanup: Optional[asyncio.Task] = None
+        self._effective_max_frame_bytes = int(registry.settings.gateway_max_frame_bytes)
         # tracker (written by the receiver thread, read by REST handlers)
         self._phase = "created"
         self._turn_id = 0
@@ -110,13 +114,45 @@ class GatewaySession:
         preserved) and queued BEFORE the receiver starts, so attach always
         replays it first; every event after it crosses verbatim (pass_raw)."""
         s = self.registry.settings
+        timeout = max(1.0, s.sglang_omni_connect_timeout_s)
+        if self._open_deadline is not None:
+            remaining = self._open_deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                raise TimeoutError("gateway handshake deadline exceeded")
+            # open() performs connect and first-event reads, each with this bound.
+            timeout = min(timeout, remaining / 2)
         client = SglangOmniClient(self.registry.pool.replica_url(index),
-                                  s.sglang_omni_connect_timeout_s)
-        created = await asyncio.to_thread(client.open)  # consumes session.created
+                                  timeout)
+        # The shared client's default 1s floor must not exceed this request's budget.
+        client.connect_timeout_s = timeout
+        self._client = client
+        opening = asyncio.create_task(asyncio.to_thread(client.open))
+        try:
+            created = await asyncio.shield(opening)
+        except BaseException:
+            async def cleanup_opening():
+                await asyncio.gather(opening, return_exceptions=True)
+                await asyncio.to_thread(client.abort_transport)
+                if self._client is client:
+                    self._client = None
+            self._opening_cleanup = asyncio.create_task(cleanup_opening())
+            self.registry.track_cleanup(self._opening_cleanup)
+            await asyncio.shield(self._opening_cleanup)
+            raise
         self._index = index
         self._client = client
         self.request_id = created.get("request_id")
         self.model = created.get("model")
+        version = created.get("model_version")
+        if isinstance(version, str) and version.strip():
+            self.model_version = version
+            self.model_version_source = "backend"
+        else:
+            self.model_version = self.registry.pool.replica_version(index)
+            self.model_version_source = "deployment" if self.model_version else "unknown"
+        created = dict(created, model_version=self.model_version,
+                       model_version_source=self.model_version_source)
+        self._effective_max_frame_bytes = int(s.gateway_max_frame_bytes)
         self._track(created)
         self._queue.put_nowait(json.dumps(created, ensure_ascii=False))
         client.start_receiver(
@@ -128,12 +164,24 @@ class GatewaySession:
 
     def _on_omni_event(self, epoch: int, raw: str, parsed: Dict[str, Any]) -> None:
         """Receiver-thread callback: track a parsed copy, queue the raw text."""
-        if epoch != self._epoch:
-            return  # stale receiver from before a reset
-        self._track(parsed)
         loop = self._loop
         if loop is not None:
-            loop.call_soon_threadsafe(self._queue.put_nowait, raw)
+            loop.call_soon_threadsafe(self._deliver_omni_event, epoch, raw, parsed)
+
+    def _deliver_omni_event(self, epoch: int, raw: str, parsed: Dict[str, Any]) -> None:
+        if epoch != self._epoch or self.destroyed:
+            return
+        if parsed.get("type") == "session.configured":
+            limit = int(self.registry.settings.gateway_max_frame_bytes)
+            upstream = parsed.get("max_frame_bytes")
+            if isinstance(upstream, int) and not isinstance(upstream, bool) and upstream > 0:
+                limit = min(limit, upstream)
+            self._effective_max_frame_bytes = limit
+            if upstream != limit:
+                parsed = dict(parsed, max_frame_bytes=limit)
+                raw = json.dumps(parsed, ensure_ascii=False)
+        self._track(parsed)
+        self._queue.put_nowait(raw)
 
     def _on_omni_close(self, epoch: int, reason: str) -> None:
         """Receiver-thread callback: the omni transport closed.
@@ -143,36 +191,39 @@ class GatewaySession:
         quarantine. Anything else is a mid-session transport death (1011 +
         DOWN). `_track` runs on this same receiver thread before the close
         callback, so reading _phase here is race-free."""
-        if epoch != self._epoch or self.destroyed:
-            return
         loop = self._loop
         if loop is None:
+            return
+        loop.call_soon_threadsafe(self._deliver_omni_close, epoch, reason)
+
+    def _deliver_omni_close(self, epoch: int, reason: str) -> None:
+        if epoch != self._epoch or self.destroyed:
             return
         if self._phase == "done":
             log.info("gateway session %s: omni closed cleanly after done",
                      self.session_id)
-            loop.call_soon_threadsafe(self._schedule_session_done)
+            self._schedule_session_done(epoch)
             return
         log.warning("gateway session %s: omni transport closed (%s)", self.session_id, reason)
-        loop.call_soon_threadsafe(self._schedule_transport_dead)
+        self._schedule_transport_dead(epoch)
 
-    def _schedule_session_done(self) -> None:
+    def _schedule_session_done(self, epoch: int) -> None:
         self._ws_close_code = WS_CLOSE_NORMAL
         asyncio.create_task(self.adestroy("omni_session_done", transport_dead=False,
-                                          end_reason=END_SESSION_DONE))
+                                          epoch=epoch, end_reason=END_SESSION_DONE))
 
-    def _schedule_transport_dead(self) -> None:
+    def _schedule_transport_dead(self, epoch: int) -> None:
         self._ws_close_code = WS_CLOSE_OMNI_DEAD
         asyncio.create_task(self.adestroy("omni_transport_dead", transport_dead=True,
-                                          end_reason=END_OMNI_DEAD))
+                                          epoch=epoch, end_reason=END_OMNI_DEAD))
 
-    async def _pump_out(self, ws: WebSocket) -> None:
+    async def _pump_out(self, ws: WebSocket, queue: asyncio.Queue, epoch: int) -> None:
         """Queue → client, verbatim. The None sentinel ends the session socket."""
         while True:
-            item = await self._queue.get()
+            item = await queue.get()
             if item is None:
                 try:
-                    await ws.close(code=self._ws_close_code)
+                    await ws.close(code=WS_CLOSE_RESET if epoch != self._epoch else self._ws_close_code)
                 except Exception:  # noqa: BLE001 — peer may already be gone
                     pass
                 return
@@ -180,20 +231,22 @@ class GatewaySession:
 
     # ------------------------------------------------------------ client → omni
 
-    async def _pump_in(self, ws: WebSocket) -> None:
+    async def _pump_in(self, ws: WebSocket, client: SglangOmniClient, epoch: int) -> None:
         """Client → omni, verbatim text; binary frames are size-policed first."""
-        max_frame = self.registry.settings.gateway_max_frame_bytes
         while True:
             message = await ws.receive()
+            if epoch != self._epoch:
+                return
             if message.get("type") == "websocket.disconnect":
                 return
             text = message.get("text")
             if text is not None:
-                await asyncio.to_thread(self._client.send_text, text)
+                await asyncio.to_thread(client.send_text, text)
                 continue
             data = message.get("bytes")
             if data is None:
                 continue
+            max_frame = self._effective_max_frame_bytes
             if len(data) > max_frame:
                 log.warning("gateway session %s: frame %dB > max %dB — closing 1009",
                             self.session_id, len(data), max_frame)
@@ -205,13 +258,23 @@ class GatewaySession:
                 except Exception:  # noqa: BLE001
                     pass
                 return
-            await asyncio.to_thread(self._client.send_bytes, data)
+            await asyncio.to_thread(client.send_bytes, data)
 
     # ------------------------------------------------------------ attach / run
 
-    def try_attach(self) -> bool:
+    def token_epoch_is_current(self, epoch: int) -> bool:
         with self._lock:
-            if self._attached or self._destroyed:
+            return epoch == self._epoch and not self._destroyed and not self._resetting
+
+    def mint_token(self) -> str:
+        with self._lock:
+            if self._destroyed or self._resetting:
+                raise KeyError(self.session_id)
+            return self.registry.tokens.mint(self.session_id, epoch=self._epoch)
+
+    def try_attach(self, epoch: Optional[int] = None) -> bool:
+        with self._lock:
+            if self._attached or self._destroyed or self._resetting or (epoch is not None and epoch != self._epoch):
                 return False
             self._attached = True
             return True
@@ -219,8 +282,8 @@ class GatewaySession:
     async def run(self, ws: WebSocket) -> None:
         """Duplex pump until either side ends; the session is then destroyed."""
         epoch = self._epoch
-        pump_out = asyncio.create_task(self._pump_out(ws))
-        pump_in = asyncio.create_task(self._pump_in(ws))
+        pump_out = asyncio.create_task(self._pump_out(ws, self._queue, epoch))
+        pump_in = asyncio.create_task(self._pump_in(ws, self._client, epoch))
         try:
             done, pending = await asyncio.wait(
                 {pump_out, pump_in}, return_when=asyncio.FIRST_COMPLETED)
@@ -232,14 +295,39 @@ class GatewaySession:
                 if exc is not None:
                     log.info("gateway session %s pump ended: %s", self.session_id, exc)
         finally:
+            for task in (pump_out, pump_in):
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(pump_out, pump_in, return_exceptions=True)
             with self._lock:
-                self._attached = False
+                if epoch == self._epoch:
+                    self._attached = False
             await self.adestroy("client_ws_ended", epoch=epoch,
                                 end_reason=END_CLIENT_DISCONNECT)
 
     # ------------------------------------------------------------ reset
 
     async def reset(self) -> Dict[str, Any]:
+        async with self._lifecycle_lock:
+            if self.destroyed:
+                raise KeyError(self.session_id)
+            self._resetting = True
+            try:
+                return await self._reset_locked()
+            except BaseException as exc:
+                cleanup = asyncio.create_task(self._adestroy_locked(
+                    "reset_failed", not isinstance(exc, asyncio.CancelledError), None, END_OMNI_DEAD))
+                self.registry.track_cleanup(cleanup)
+                await asyncio.shield(cleanup)
+                if isinstance(exc, asyncio.CancelledError):
+                    raise
+                if isinstance(exc, SessionCapacityExceeded):
+                    raise GatewayCapacityError(self.registry.pool.capacity, self.registry.pool.busy) from exc
+                raise GatewayUnavailableError("failed to reopen realtime session") from exc
+            finally:
+                self._resetting = False
+
+    async def _reset_locked(self) -> Dict[str, Any]:
         """Close the omni connection, reopen on the SAME replica, mint a fresh
         ws_token, zero the counters. Same response shape as session create.
         The old connection's meter closes with a `reset` ledger record; the new
@@ -249,6 +337,7 @@ class GatewaySession:
         log.info("gateway session %s reset (trace_id=%s)", self.session_id, self.trace_id)
         self._write_usage(END_RESET)  # close the old meter BEFORE zeroing
         self._epoch += 1  # detach stale receivers/pumps from the old connection
+        self.registry.tokens.revoke_session(self.session_id)
         if self.attached:
             self._ws_close_code = WS_CLOSE_RESET
             self._queue.put_nowait(None)  # end the old run()'s pump-out
@@ -267,20 +356,18 @@ class GatewaySession:
         self.created_at = time.time()  # fresh meter + fresh attach window
         self._ws_close_code = WS_CLOSE_NORMAL
         self._queue = asyncio.Queue()  # fresh queue: no stale events, no sentinel
-        try:
-            await self._open_client(self._index, epoch=self._epoch)
-        except Exception as exc:  # noqa: BLE001
-            # the replica is likely wedged — quarantine it and drop the session
-            self.registry.pool.release(self._index, transport_dead=True)
-            with self._lock:
-                self._destroyed = True
-            self._write_usage(END_OMNI_DEAD)
-            self.registry.metrics.inc(COUNTER_ABNORMAL_DISCONNECTS)
-            self.registry.metrics.add_gauge(GAUGE_ACTIVE_SESSIONS, -1)
-            self.registry.remove(self.session_id)
-            raise GatewayCapacityError(self.registry.pool.capacity,
-                                       self.registry.pool.busy) from exc
-        token = self.registry.tokens.mint(self.session_id)
+        deadline = asyncio.get_running_loop().time() + max(0.01, self.registry.settings.gateway_create_timeout_s)
+        self._open_deadline = deadline
+        async with asyncio.timeout_at(deadline):
+            while True:
+                try:
+                    await self._open_client(self._index, epoch=self._epoch)
+                    break
+                except SessionCapacityExceeded:
+                    if asyncio.get_running_loop().time() + 0.1 >= deadline:
+                        raise
+                    await asyncio.sleep(0.1)
+        token = self.registry.tokens.mint(self.session_id, epoch=self._epoch)
         return self.create_payload(token)
 
     # ------------------------------------------------------------ teardown
@@ -295,6 +382,8 @@ class GatewaySession:
                 "session_id": self.session_id,
                 "request_id": self.request_id,
                 "model": self.model,
+                "model_version": self.model_version,
+                "model_version_source": self.model_version_source,
                 "replica_url": (self.registry.pool.replica_url(self._index)
                                 if self._index >= 0 else None),
                 "created_at": self.created_at,
@@ -313,6 +402,11 @@ class GatewaySession:
     async def adestroy(self, reason: str, transport_dead: bool = False,
                        epoch: Optional[int] = None,
                        end_reason: str = END_SHUTDOWN) -> None:
+        async with self._lifecycle_lock:
+            await self._adestroy_locked(reason, transport_dead, epoch, end_reason)
+
+    async def _adestroy_locked(self, reason: str, transport_dead: bool,
+                              epoch: Optional[int], end_reason: str) -> None:
         """Idempotent. epoch is set by run(): a stale pump from before a reset
         must not release the slot the reset just re-acquired."""
         with self._lock:
@@ -321,6 +415,7 @@ class GatewaySession:
             if self._destroyed:
                 return
             self._destroyed = True
+        self.registry.tokens.revoke_session(self.session_id)
         log.info("gateway session %s destroyed (%s, trace_id=%s)",
                  self.session_id, reason, self.trace_id)
         metrics = self.registry.metrics
@@ -336,12 +431,17 @@ class GatewaySession:
                 queue.put_nowait(None)  # wake pump-out so it closes the client ws
             except Exception:  # noqa: BLE001
                 pass
-        client = self._client
-        if client is not None:
-            await asyncio.to_thread(client.close)
-        if self._index >= 0:
-            self.registry.pool.release(self._index, transport_dead=transport_dead)
-        self.registry.remove(self.session_id)
+        try:
+            if self._opening_cleanup is not None:
+                await asyncio.shield(self._opening_cleanup)
+            client = self._client
+            if client is not None:
+                await asyncio.to_thread(client.close)
+        finally:
+            if self._owns_slot:
+                self._owns_slot = False
+                self.registry.pool.release(self._index, transport_dead=transport_dead)
+            self.registry.remove(self.session_id)
 
     # ------------------------------------------------------------ introspection
 
@@ -354,6 +454,8 @@ class GatewaySession:
             # doc §7: the REST response carries model/version info alongside
             # session.created (snapshot() has it too)
             "model": self.model,
+            "model_version": self.model_version,
+            "model_version_source": self.model_version_source,
         }
 
     def snapshot(self) -> Dict[str, Any]:
@@ -369,6 +471,8 @@ class GatewaySession:
                 "turn_id": self._turn_id,
                 "created_at": self.created_at,
                 "model": self.model,
+                "model_version": self.model_version,
+                "model_version_source": self.model_version_source,
                 "request_id": self.request_id,
                 "attached": self._attached,
                 "replica": self.registry.pool.replica_url(self._index)
@@ -435,33 +539,92 @@ class GatewayRegistry:
         self._sessions: Dict[str, GatewaySession] = {}
         self._lock = threading.Lock()
         self._janitor: Optional[asyncio.Task] = None
+        self._closed = False
+        self._creating: set[asyncio.Task] = set()
+        self._cleanup_tasks: set[asyncio.Task] = set()
+
+    def track_cleanup(self, task: asyncio.Task) -> None:
+        self._cleanup_tasks.add(task)
+        def completed(done):
+            self._cleanup_tasks.discard(done)
+            if not done.cancelled() and done.exception() is not None:
+                log.error("gateway cleanup failed: %s", done.exception())
+        task.add_done_callback(completed)
 
     # ---- sessions ----
 
     async def create(self) -> GatewaySession:
+        if self._closed:
+            raise GatewayUnavailableError("gateway is shutting down")
         self.ensure_janitor()
+        task = asyncio.current_task()
+        self._creating.add(task)
+        try:
+            return await self._create()
+        finally:
+            self._creating.discard(task)
+
+    async def _create(self) -> GatewaySession:
+        attempted: set[int] = set()
+        last_error: Optional[Exception] = None
+        deadline = asyncio.get_running_loop().time() + max(0.01, self.settings.gateway_create_timeout_s)
         while True:
-            index = self.pool.acquire()  # raises GatewayCapacityError when full
-            session = GatewaySession(self, session_id=f"gws-{uuid.uuid4().hex[:16]}")
+            if self._closed:
+                raise GatewayUnavailableError("gateway is shutting down")
+            if asyncio.get_running_loop().time() >= deadline:
+                raise GatewayUnavailableError("gateway create deadline exceeded") from last_error
             try:
-                await session.open_on_replica(index)
+                index = self.pool.acquire(exclude=attempted)
+            except GatewayCapacityError:
+                if last_error is not None or not self.pool.routable_replicas():
+                    raise GatewayUnavailableError("no reachable sglang-omni replica") from last_error
+                raise
+            attempted.add(index)
+            session = GatewaySession(self, session_id=f"gws-{uuid.uuid4().hex[:16]}")
+            session._open_deadline = deadline
+            transferred = False
+            capacity_rejected = False
+            transport_dead = False
+            try:
+                async with asyncio.timeout_at(deadline):
+                    await session.open_on_replica(index)
+                if self._closed:
+                    raise asyncio.CancelledError()
+                session._owns_slot = True
+                transferred = True
+                with self._lock:
+                    self._sessions[session.session_id] = session
+                self.metrics.inc(COUNTER_SESSIONS_CREATED)
+                self.metrics.add_gauge(GAUGE_ACTIVE_SESSIONS, 1)
+                log.info("gateway session %s -> replica %d request=%s version=%s trace_id=%s",
+                         session.session_id, index, session.request_id,
+                         session.model_version, session.trace_id)
+                return session
             except SessionCapacityExceeded:
-                # the instance is full server-side, not wedged — skip it
-                log.warning("gateway create: replica %d at session capacity", index)
-                self.pool.mark_full(index)
-                continue
-            except Exception as exc:  # noqa: BLE001 — handshake/open failure
+                capacity_rejected = True
+            except Exception as exc:
+                last_error = exc
+                transport_dead = True
                 log.warning("gateway create: replica %d open failed: %s", index, exc)
-                self.pool.release(index, transport_dead=True)
-                continue
-            with self._lock:
-                self._sessions[session.session_id] = session
-            self.metrics.inc(COUNTER_SESSIONS_CREATED)
-            self.metrics.add_gauge(GAUGE_ACTIVE_SESSIONS, 1)
-            log.info("gateway session %s → replica %d (%s) trace_id=%s",
-                     session.session_id, index, self.pool.replica_url(index),
-                     session.trace_id)
-            return session
+            finally:
+                if not transferred:
+                    cleanup = asyncio.create_task(self._rollback_create(
+                        session, index, capacity_rejected, transport_dead))
+                    self.track_cleanup(cleanup)
+                    await asyncio.shield(cleanup)
+
+    async def _rollback_create(self, session, index, capacity_rejected, transport_dead):
+        session._destroyed = True
+        try:
+            if session._opening_cleanup is not None:
+                await asyncio.shield(session._opening_cleanup)
+            if session._client is not None:
+                await asyncio.to_thread(session._client.close)
+        finally:
+            if capacity_rejected:
+                self.pool.mark_full(index)
+            else:
+                self.pool.release(index, transport_dead=transport_dead)
 
     def get(self, session_id: str) -> Optional[GatewaySession]:
         with self._lock:
@@ -505,8 +668,16 @@ class GatewayRegistry:
     # ---- shutdown ----
 
     async def aclose(self) -> None:
+        self._closed = True
+        creating = [task for task in self._creating if task is not asyncio.current_task()]
+        for task in creating:
+            task.cancel()
+        await asyncio.gather(*creating, return_exceptions=True)
+        while self._cleanup_tasks:
+            await asyncio.gather(*tuple(self._cleanup_tasks), return_exceptions=True)
         if self._janitor is not None:
             self._janitor.cancel()
+            await asyncio.gather(self._janitor, return_exceptions=True)
             self._janitor = None
         with self._lock:
             sessions = list(self._sessions.values())

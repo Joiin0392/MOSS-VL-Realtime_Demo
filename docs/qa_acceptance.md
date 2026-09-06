@@ -33,7 +33,7 @@
 | park 超时（omni error{response_failed} 透传 → 服务端关闭 → 客户端 1011、会话销毁） | 协议语义：`server/tests/test_gateway_qa.py::test_qa_8_2_park_timeout_response_failed`；真实 300s 计时：真机清单 | 已自动化（协议语义）+ 需真机（计时行为） |
 | 容量超限 | 同 §8.1 并发控制各行 | 已自动化 |
 | 长时间无输入 | 与 park 超时同路径，合并于 `test_qa_8_2_park_timeout_response_failed` | 已自动化（协议语义）+ 需真机（计时行为） |
-| kill 实例接力恢复（memory 接力，P2） | 逻辑：`server/tests/test_failover.py::test_failure_relay`；真机演练：真机清单 | 已自动化（逻辑）+ 需真机（演练） |
+| 实例宕机隔离与新建会话 | 网关：`server/tests/test_gateway_ws.py::test_ws_omni_death`；memory 接力仅属 Demo：`server/tests/test_failover.py::test_failure_relay` | 分平面验收，不互相替代 |
 
 ## §8.3 性能稳定
 
@@ -57,9 +57,8 @@ P50/P95/P99/稳定性/资源/容量策略）。P5 报告中每项需含
    首帧时延、单轮时延、丢帧率（数据入 P5 报告，限制数值回填协议文档 D 节）。
 3. **长会话稳定性**：单会话连续运行（数小时级）成功率、断开率、内存/
    显存曲线、队列积压（数据入 P5 报告）。
-4. **kill 实例 memory 接力演练**：真机 kill 一个 omni 实例，验证 P2
-   memory 接力恢复链路的实际表现（`test_failover.py::test_failure_relay`
-   为逻辑级自动化），演练记录入 P8 故障预案。
+4. **kill 实例演练**：薄网关验证 1011 终止、故障副本隔离和健康实例新建。
+   Demo 的 memory 接力另测，不作为薄网关能力承诺。
 5. **gateway 重启会话断开语义**：重启 gateway 进程，验证全部在途会话
    断开、客户端重连需重新走 REST 建 Session（gateway 平面无
    grace/reconnect，见 GATEWAY_PLAN.md §2-P1），演练记录入 P8。

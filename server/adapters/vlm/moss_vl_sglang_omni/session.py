@@ -2,7 +2,7 @@
 
 Two design loads carry the whole adapter:
 
-1. **Event → control-token mapping** (orchestrator stays untouched). The
+1. **Event → control-token mapping**. The
    sglang-omni structured event stream is translated back into the exact
    control-token text stream the demo orchestrator already parses
    (server/session/orchestrator.py:47-58):
@@ -33,6 +33,7 @@ consumed it) and the put call raises — the session itself stays alive.
 """
 from __future__ import annotations
 
+import math
 import queue
 import threading
 import time
@@ -46,6 +47,15 @@ from .client import SglangOmniClient
 log = get_logger(__name__)
 
 INPUT_ACK_TIMEOUT_S = 30.0  # waiting for frame.ready / *.accepted must not hang forever
+MAX_FRAME_BYTES = 32 * 1024 * 1024
+
+
+class InputRejected(ValueError):
+    """An input was explicitly rejected before the server accepted its sequence."""
+
+
+class ContextRolloverRequired(RuntimeError):
+    """The current connection needs a fresh context before more inputs."""
 
 
 def _encode_image(image: Any) -> bytes:
@@ -84,9 +94,9 @@ class _InputWaiter:
 class _TextTokenMirror:
     """Local text-token estimate for status()["text_tokens"] (rollover feed).
 
-    sglang-omni exposes no token counters, so the gateway mirrors the TEXT
-    side: configure prompts + input prompts + output deltas. Exact when the
-    checkpoint tokenizer is loadable (transformers present), else len//2.
+    Fallback for older backends without negotiated session.usage: configure
+    prompts + input prompts + output deltas. This is only an estimate, even
+    with a tokenizer: per-delta tokenization is not the generated history.
     Lazy + failure-proof: a broken tokenizer degrades to the heuristic once,
     never raises into the session path.
     """
@@ -131,9 +141,14 @@ class _TextTokenMirror:
 class SglangOmniSession:
     """VlmRealtimeSession facade over one sglang-omni realtime connection."""
 
+    turn_interrupt_is_local = True
+
     def __init__(self, client: SglangOmniClient, created: Dict[str, Any], *,
                  input_queue_capacity: int = 4,
                  input_drop_wait_seconds: float = 0.5,
+                 fallback_context_length: int = 131072,
+                 fallback_frame_tokens: int = 2048,
+                 context_reserve_tokens: int = 4096,
                  model_path: str = ""):
         self._client = client
         self.session_id = str(created.get("session_id") or "")
@@ -149,11 +164,23 @@ class SglangOmniSession:
         self._input_capacity = max(1, int(input_queue_capacity))
         self._input_drop_wait = max(0.0, float(input_drop_wait_seconds))
         self._waiters: Dict[int, _InputWaiter] = {}
+        self._sending_input: Optional[_InputWaiter] = None
         self._next_seq_no = 0
         self._input_lock = threading.Lock()   # serializes the two-phase frame send
         self._last_timestamp = 0.0
         self._current_turn_id = int(created.get("turn_id") or 0)
         self._round_open_turn: Optional[int] = None  # turn_id whose <|round_start|> went out
+        self._output_epoch = 0
+        self._muted = False
+        self._resume_after_seq = 0
+        self._usage_supported = "session.usage" in created.get("capabilities", ())
+        self._usage: Optional[Dict[str, int]] = None
+        self._fallback_context_length = max(1, int(fallback_context_length))
+        self._fallback_frame_tokens = max(1, int(fallback_frame_tokens))
+        self._context_reserve_tokens = max(1, int(context_reserve_tokens))
+        self._largest_extend = 512
+        self._context_rollover = False
+        self._generation_rate = 4.0
 
         self._outputs: "queue.Queue[Dict[str, Any]]" = queue.Queue()
         self._tokens = _TextTokenMirror(model_path)
@@ -171,6 +198,10 @@ class SglangOmniSession:
 
     def configure(self, payload: Dict[str, Any], timeout_s: float) -> None:
         """Complete the handshake, then hand the socket to the recv thread."""
+        payload = dict(payload)
+        if self._usage_supported:
+            payload["include_usage"] = True
+        self._generation_rate = min(512.0, float(payload.get("max_tokens_per_turn") or 4.0))
         self._client.configure(payload, timeout_s, on_event=self._handle_event)
         for key in ("prompt", "system_prompt"):
             text = payload.get(key)
@@ -222,14 +253,17 @@ class SglangOmniSession:
         if not prompt:
             raise ValueError("prompt must not be empty")
         with self._input_lock:
+            self._ensure_active()
+            if self._context_status()["rollover_required"]:
+                raise ContextRolloverRequired("realtime context needs rollover before accepting a prompt")
             waiter = self._next_input("prompt", prompt=True)
-            self._client.send_json({
-                "type": "input.prompt",
-                "seq_no": waiter.seq_no,
-                "prompt": prompt,
-                "final": False,
-            })
-            self._wait(waiter.accepted, waiter, "prompt.accepted")
+            def submit():
+                self._client.send_json({
+                    "type": "input.prompt", "seq_no": waiter.seq_no,
+                    "prompt": prompt, "final": False,
+                })
+                self._wait(waiter.accepted, waiter, "prompt.accepted")
+            self._submit_input(waiter, submit)
             with self._state_lock:
                 self.prompts_received += 1
             self._tokens.add(prompt)
@@ -237,8 +271,8 @@ class SglangOmniSession:
 
     def put_prompt_frame(self, prompt: str, image: Any, timestamp: Optional[float] = None,
                          byte_size: Optional[int] = None, drop_pending: bool = True) -> Dict[str, Any]:
-        # drop_pending is a server-side pacing concern in sglang-omni (the input
-        # queue + delayed frame.ready IS the dropping mechanism) — not sent.
+        # Accepted remote inputs cannot be retracted by this protocol. Local
+        # credit drops only unsent pure frames; the prompt itself is never dropped.
         del drop_pending
         self._ensure_active()
         raw = _encode_image(image)
@@ -246,10 +280,18 @@ class SglangOmniSession:
             return self._put_frame_locked(raw, timestamp, byte_size, prompt=str(prompt or ""))
 
     def request_turn_end(self) -> Dict[str, Any]:
-        """Barge-in soft interrupt; the ack arrives as response.turn.interrupted."""
-        self._ensure_active()
-        self._client.send_json({"type": "session.abort"})
+        """Mute locally until a subsequently submitted prompt changes the turn."""
+        with self._state_lock:
+            self._ensure_active()
+            self._muted = True
+            self._resume_after_seq = self._next_seq_no
+            self._output_epoch += 1
+            self._round_open_turn = None
         return self.status(extra={"turn_interrupt_pending": True})
+
+    def output_event_is_current(self, event: Dict[str, Any]) -> bool:
+        with self._state_lock:
+            return event.get("output_epoch", self._output_epoch) == self._output_epoch
 
     def poll_output(self, timeout_seconds: float = 0.0, max_items: int = 128) -> OutputBatch:
         events: List[Dict[str, Any]] = []
@@ -263,6 +305,7 @@ class SglangOmniSession:
                 events.append(self._outputs.get_nowait())
             except queue.Empty:
                 break
+        events = [ev for ev in events if self.output_event_is_current(ev)]
         chunks = [str(ev.get("text") or "") for ev in events]
         return OutputBatch(active=self._active, chunks=chunks,
                            chunk_events=events, status=self.status())
@@ -282,7 +325,8 @@ class SglangOmniSession:
                 "prompts_consumed": self.prompts_consumed,
                 "outputs_emitted": self.outputs_emitted,
                 "bytes_received": self.bytes_received,
-                "text_tokens": self._tokens.total,
+                "text_tokens": self._usage["decoder_tokens"] if self._usage else self._tokens.total,
+                "context": self._context_status(),
                 "frame_queue_size": sum(1 for w in self._waiters.values() if not w.prompt),
                 "prompt_queue_size": sum(1 for w in self._waiters.values() if w.prompt),
                 "output_queue_size": self._outputs.qsize(),
@@ -320,12 +364,38 @@ class SglangOmniSession:
 
     # ------------------------------------------------------------ input path
 
+    def _context_status(self) -> Dict[str, Any]:
+        with self._state_lock:
+            pending = len(self._waiters)
+            if self._usage is not None:
+                limit = self._usage["context_limit"]
+                used = self._usage["token_space_used"]
+                # Pending inputs may not yet be represented in the last snapshot.
+                used += pending * self._largest_extend
+                exact = True
+            else:
+                limit = self._fallback_context_length
+                generated_bound = int(max(0, time.time() - self.created_at) * self._generation_rate)
+                used = ((self.frames_received + pending) * self._fallback_frame_tokens
+                        + self._tokens.total + generated_bound)
+                exact = False
+            reserve = min(limit // 2, max(self._context_reserve_tokens, limit // 10,
+                                          (self._input_capacity + 2) * self._largest_extend))
+            remaining = max(0, limit - used)
+            if remaining <= reserve:
+                self._context_rollover = True
+            return {"context_limit": limit, "token_space_used": used,
+                    "context_remaining": remaining, "reserve_tokens": reserve,
+                    "source": "backend_with_pending_reserve" if exact else "conservative_estimate",
+                    "rollover_required": self._context_rollover}
+
     def _next_input(self, kind: str, prompt: bool) -> _InputWaiter:
         with self._state_lock:
             seq_no = self._next_seq_no
             self._next_seq_no += 1
             waiter = _InputWaiter(seq_no=seq_no, kind=kind, prompt=prompt)
             self._waiters[seq_no] = waiter
+            self._sending_input = waiter
         return waiter
 
     def _await_input_credit(self) -> bool:
@@ -349,7 +419,18 @@ class SglangOmniSession:
 
     def _put_frame_locked(self, raw: bytes, timestamp: Optional[float],
                           byte_size: Optional[int], *, prompt: str) -> Dict[str, Any]:
+        self._ensure_active()
         mime = _mime_type(raw)
+        if not raw or len(raw) > MAX_FRAME_BYTES:
+            raise ValueError("frame exceeds max_frame_bytes or is empty")
+        requested_ts = float(timestamp) if timestamp is not None else max(0.0, time.time() - self.created_at)
+        if not math.isfinite(requested_ts) or requested_ts < 0:
+            raise ValueError("timestamp must be finite and non-negative")
+        if self._context_status()["rollover_required"]:
+            if prompt:
+                raise ContextRolloverRequired("realtime context needs rollover before accepting a prompt")
+            self.frames_dropped += 1
+            return self.status(extra={"frame_dropped": True, "drop_reason": "context_rollover"})
         # credit gate applies to PURE frames only — prompt-carrying inputs must
         # never drop (a full queue of slow frames would otherwise starve them)
         if not prompt and not self._await_input_credit():
@@ -357,26 +438,22 @@ class SglangOmniSession:
                 self.frames_dropped += 1
             return self.status(extra={"frame_dropped": True,
                                       "drop_reason": "sglang_omni_input_backpressure"})
-        requested_ts = float(timestamp) if timestamp is not None else max(0.0, time.time() - self.created_at)
         with self._state_lock:
             # the server requires monotonic transport timestamps; browser frame
             # encoding can deliver an older capture after a newer one
             ts = max(requested_ts, self._last_timestamp)
-            self._last_timestamp = ts
         waiter = self._next_input("frame", prompt=bool(prompt))
-        self._client.send_json({
-            "type": "input.frame",
-            "seq_no": waiter.seq_no,
-            "timestamp": ts,
-            "prompt": prompt or None,
-            "final": False,
-            "mime_type": mime,
-        })
-        # two-phase send, strictly serialized: metadata → frame.ready → bytes
-        self._wait(waiter.ready, waiter, "frame.ready")
-        self._client.send_bytes(raw)
-        self._wait(waiter.accepted, waiter, "frame.accepted")
+        def submit():
+            self._client.send_json({
+                "type": "input.frame", "seq_no": waiter.seq_no, "timestamp": ts,
+                "prompt": prompt or None, "final": False, "mime_type": mime,
+            })
+            self._wait(waiter.ready, waiter, "frame.ready")
+            self._client.send_bytes(raw)
+            self._wait(waiter.accepted, waiter, "frame.accepted")
+        self._submit_input(waiter, submit)
         with self._state_lock:
+            self._last_timestamp = ts
             self.frames_received += 1
             self.bytes_received += int(byte_size if byte_size is not None else len(raw))
             if prompt:
@@ -385,17 +462,49 @@ class SglangOmniSession:
             self._tokens.add(prompt)
         return self.status(extra={"timestamp": ts, "frame_seq_no": waiter.seq_no})
 
+    def _submit_input(self, waiter: _InputWaiter, submit: Any) -> None:
+        try:
+            submit()
+        except InputRejected:
+            raise
+        except Exception as exc:
+            # ACK loss is ambiguous: never reuse a sequence the server may own.
+            self._error = str(exc)
+            self._emit_error_chunk(str(exc))
+            self._mark_ended("input_uncertain")
+            self._client.close()
+            raise
+        finally:
+            with self._state_lock:
+                if self._sending_input is waiter:
+                    self._sending_input = None
+
     def _wait(self, event: threading.Event, waiter: _InputWaiter, label: str) -> None:
         if not event.wait(INPUT_ACK_TIMEOUT_S):
             raise TimeoutError(
                 f"timed out waiting for sglang-omni {label} (seq_no={waiter.seq_no})")
         if waiter.error:
+            if self._active:
+                raise InputRejected(waiter.error)
             raise RuntimeError(waiter.error)
 
     # ------------------------------------------------------------ event handling
 
     def _handle_event(self, message: Dict[str, Any]) -> None:
         event_type = str(message.get("type") or "")
+        if event_type == "session.usage":
+            fields = ("decoder_tokens", "encoder_tokens", "token_space_used", "context_limit")
+            if not all(isinstance(message.get(key), int) and not isinstance(message[key], bool)
+                       and message[key] >= 0 for key in fields) or message["context_limit"] <= 0:
+                self._handle_error({"code": "invalid_usage", "message": "invalid backend context usage"}, None, None)
+                return
+            with self._state_lock:
+                if self._usage is not None and message["encoder_tokens"] > self._usage["encoder_tokens"]:
+                    self._largest_extend = max(self._largest_extend,
+                        message["token_space_used"] - self._usage["token_space_used"])
+                self._usage = {key: message[key] for key in fields}
+                self._context_status()
+            return
         seq_no_raw = message.get("seq_no")
         seq_no = int(seq_no_raw) if isinstance(seq_no_raw, int) else None
         with self._state_lock:
@@ -429,11 +538,13 @@ class SglangOmniSession:
             with self._state_lock:
                 if turn_id != self._current_turn_id:
                     return  # straggler from an interrupted turn
+                self._tokens.add(text)
+                if self._muted:
+                    return
                 if self._round_open_turn != turn_id:
                     self._round_open_turn = turn_id
                     self._emit("<|round_start|>", message)
-            self._tokens.add(text)
-            self._emit(text, message)
+                self._emit(text, message)
             return
         if event_type == "response.turn.silence":
             # the model went idle = the spoken round's end-of-turn signal
@@ -447,8 +558,12 @@ class SglangOmniSession:
             with self._state_lock:
                 self._current_turn_id = next_turn
                 self._round_open_turn = None
-            self._emit("<|eot_id|>", {**message, "turn_id": old_turn,
-                                      "next_turn_id": next_turn})
+                if self._muted:
+                    if seq_no is None or seq_no < self._resume_after_seq:
+                        return
+                    self._muted = False
+                self._emit("<|eot_id|>", {**message, "turn_id": old_turn,
+                                          "next_turn_id": next_turn})
             return
         if event_type == "response.done":
             # once per session lifetime; session.done + server close follow
@@ -470,22 +585,28 @@ class SglangOmniSession:
             # single event rejected, session survives: fail this waiter, free
             # its credit, and roll the dense seq counter back over the rejected
             # seq_no (the server never consumed it)
-            if waiter is not None:
-                waiter.error = text
-                waiter.ready.set()
-                waiter.accepted.set()
-                waiter.processed.set()
-                with self._input_credit:
+            with self._input_credit:
+                if seq_no is None:
+                    waiter = self._sending_input
+                can_reject = waiter is not None and not waiter.accepted.is_set()
+                if can_reject:
+                    waiter.error = text
                     self._waiters.pop(waiter.seq_no, None)
                     if waiter.seq_no == self._next_seq_no - 1:
                         self._next_seq_no = waiter.seq_no
+                    waiter.ready.set()
+                    waiter.accepted.set()
+                    waiter.processed.set()
                     self._input_credit.notify_all()
-            log.warning("sglang-omni rejected input seq_no=%s: %s", seq_no, text)
-            return
+            if can_reject:
+                log.warning("sglang-omni rejected input seq_no=%s: %s", waiter.seq_no, text)
+                return
+            # No unique unaccepted input owns this error. End instead of guessing.
         # input_submission_failed / response_failed / unknown: session-fatal
         self._error = text
         self._emit_error_chunk(text)
         self._mark_ended(f"error:{code or 'unknown'}")
+        self._client.close()
 
     def _emit(self, text: str, message: Dict[str, Any]) -> None:
         if not text:
@@ -496,6 +617,7 @@ class SglangOmniSession:
             "emitted_at": time.time(),
             "turn_id": message.get("turn_id", self._current_turn_id),
             "sglang_event_type": message.get("type"),
+            "output_epoch": self._output_epoch,
         }
         for key in ("seq_no", "finish_reason", "next_turn_id", "silence_seq"):
             if message.get(key) is not None:

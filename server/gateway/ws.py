@@ -36,8 +36,8 @@ async def realtime_ws(websocket: WebSocket):
     tokens = get_gateway_tokens(websocket)
     registry = get_gateway_registry(websocket)
 
-    session_id, reason = tokens.consume_detailed(websocket.query_params.get("ws_token"))
-    if session_id is None:
+    binding, reason = tokens.consume_binding(websocket.query_params.get("ws_token"))
+    if binding is None:
         if reason == "expired":
             registry.metrics.inc_error("ws_token_expired")
             await _reject(websocket, "ws_token_expired", "ws_token has expired")
@@ -46,12 +46,17 @@ async def realtime_ws(websocket: WebSocket):
             await _reject(websocket, "ws_token_invalid", "missing or unknown ws_token")
         return
 
+    session_id, epoch = binding
     session = registry.get(session_id)
     if session is None:
         registry.metrics.inc_error("session_not_found")
         await _reject(websocket, "session_not_found", f"no such session: {session_id}")
         return
-    if not session.try_attach():
+    if not session.token_epoch_is_current(epoch):
+        registry.metrics.inc_error("ws_token_invalid")
+        await _reject(websocket, "ws_token_invalid", "ws_token belongs to an earlier session generation")
+        return
+    if not session.try_attach(epoch):
         registry.metrics.inc_error("session_already_attached")
         await _reject(websocket, "session_already_attached",
                       f"session {session_id} already has a live data socket")
