@@ -45,10 +45,22 @@ def http_to_ws_url(base_url: str) -> str:
 class SglangOmniClient:
     """Owns the transport for ONE sglang-omni realtime session."""
 
-    def __init__(self, base_url: str, connect_timeout_s: float = 10.0):
+    def __init__(self, base_url: str, connect_timeout_s: float = 10.0,
+                 ping_interval_s: float = 20.0, ping_timeout_s: float = 20.0):
         self.base_url = base_url
         self.ws_url = http_to_ws_url(base_url)
         self.connect_timeout_s = max(1.0, float(connect_timeout_s))
+        # Downstream keepalive (gateway doc §4: the gateway maintains the
+        # downstream itself). websocket-client's create_connection ping_*
+        # kwargs are dead store in this version — only WebSocketApp honors
+        # them — so start_receiver() runs an explicit ping thread: send a
+        # ping every ping_interval_s, declare the peer dead when no frame
+        # (any frame counts, pongs included) arrived within ping_timeout_s
+        # of the previous ping. 0 disables.
+        self.ping_interval_s = max(0.0, float(ping_interval_s))
+        self.ping_timeout_s = max(0.05, float(ping_timeout_s))
+        self._last_seen = 0.0
+        self._ping_thread: Optional[threading.Thread] = None
         self._ws: Any = None
         self._send_lock = threading.Lock()
         self._recv_thread: Optional[threading.Thread] = None
@@ -62,6 +74,7 @@ class SglangOmniClient:
 
         self._ws = websocket.create_connection(
             self.ws_url, timeout=self.connect_timeout_s, enable_multithread=True)
+        self._last_seen = time.monotonic()
         first = self._recv_event()
         if first.get("type") == "error":
             if first.get("code") == "session_capacity_exceeded":
@@ -117,13 +130,14 @@ class SglangOmniClient:
         on_event(raw_text, parsed); the default calls on_event(parsed).
         """
         self._ws.settimeout(1.0)  # poll for local close while blocking on recv
+        self._start_keepalive()
 
         def loop() -> None:
             reason = "ws_closed"
             try:
                 while not self._closed.is_set():
                     try:
-                        raw, message = self._recv_message()
+                        got = self._recv_message()
                     except Exception as exc:  # noqa: BLE001
                         if self._closed.is_set():
                             break
@@ -132,6 +146,9 @@ class SglangOmniClient:
                         reason = f"ws_closed: {exc}"
                         log.warning("sglang-omni recv failed (%s): %s", self.ws_url, exc)
                         break
+                    if got is None:
+                        continue  # pong — keepalive proof, not an event
+                    raw, message = got
                     on_event(raw, message) if pass_raw else on_event(message)
             finally:
                 self._closed.set()
@@ -140,6 +157,42 @@ class SglangOmniClient:
         self._recv_thread = threading.Thread(
             target=loop, name=f"sglang-omni-recv-{id(self) & 0xFFFF:04x}", daemon=True)
         self._recv_thread.start()
+
+    def _start_keepalive(self) -> None:
+        """Ping every ping_interval_s; if no frame arrived within
+        ping_timeout_s of the previous ping, the peer is half-open — abort()
+        so the receiver loop errors out and fires on_close (gateway: 1011 +
+        replica quarantine). Parked sessions stay alive through this because
+        the omni server auto-answers pings even while silent."""
+        if self.ping_interval_s <= 0 or self._ping_thread is not None:
+            return
+
+        def keepalive() -> None:
+            while not self._closed.wait(self.ping_interval_s):
+                # capture BEFORE ping(): a fast pong may land before ping()
+                # returns, and it must count as an answer to this ping
+                sent_at = time.monotonic()
+                try:
+                    self._ws.ping()
+                except Exception as exc:  # noqa: BLE001 — send side is dead
+                    log.warning("sglang-omni %s ping failed: %s", self.ws_url, exc)
+                    break
+                # wait out the pong deadline (or an early local close)
+                if self._closed.wait(self.ping_timeout_s):
+                    return
+                if self._last_seen < sent_at:
+                    log.warning("sglang-omni %s missed pong for %.0fs — aborting",
+                                self.ws_url, self.ping_timeout_s)
+                    break
+            try:
+                self._ws.abort()
+            except Exception:  # noqa: BLE001
+                pass
+
+        self._ping_thread = threading.Thread(
+            target=keepalive, name=f"sglang-omni-ping-{id(self) & 0xFFFF:04x}",
+            daemon=True)
+        self._ping_thread.start()
 
     def send_json(self, payload: Dict[str, Any]) -> None:
         with self._send_lock:
@@ -164,13 +217,25 @@ class SglangOmniClient:
         if self._recv_thread is not None and self._recv_thread is not threading.current_thread():
             self._recv_thread.join(timeout=2.0)
 
-    def _recv_message(self) -> Tuple[str, Dict[str, Any]]:
-        """(raw_text, parsed) for one inbound event; raises on binary/close."""
-        raw = self._ws.recv()
-        if isinstance(raw, (bytes, bytearray)):
-            if len(raw) > MAX_INBOUND_FRAME_BYTES:
+    def _recv_message(self) -> Optional[Tuple[str, Dict[str, Any]]]:
+        """(raw_text, parsed) for one inbound event; None for a pong
+        (keepalive proof). Raises on binary/close. Frame-level recv so pongs
+        are observable — websocket-client's recv() silently eats them."""
+        from websocket._abnf import ABNF
+        with self._ws.readlock:
+            opcode, frame = self._ws.recv_data_frame(control_frame=True)
+        self._last_seen = time.monotonic()  # any inbound frame proves liveness
+        if opcode == ABNF.OPCODE_PONG:
+            return None
+        if opcode == ABNF.OPCODE_CLOSE:
+            raise ConnectionError("sglang-omni WebSocket closed")
+        if opcode != ABNF.OPCODE_TEXT:
+            data = frame.data
+            if isinstance(data, (bytes, bytearray)) and len(data) > MAX_INBOUND_FRAME_BYTES:
                 raise RuntimeError("oversized inbound frame from sglang-omni")
             raise RuntimeError("unexpected binary event from sglang-omni")
+        data = frame.data
+        raw = data.decode("utf-8") if isinstance(data, (bytes, bytearray)) else data
         if not raw:
             raise ConnectionError("sglang-omni WebSocket closed")
         message = json.loads(raw)
@@ -179,4 +244,7 @@ class SglangOmniClient:
         return raw, message
 
     def _recv_event(self) -> Dict[str, Any]:
-        return self._recv_message()[1]
+        while True:
+            got = self._recv_message()
+            if got is not None:
+                return got[1]

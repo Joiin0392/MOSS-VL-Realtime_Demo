@@ -43,6 +43,9 @@ export interface SessionUiConfig {
   temperature?: number;
   topP?: number;
   topK?: number;
+  /** Generation rate cap, tokens/SECOND (omni max_tokens_per_turn).
+   *  Creation-time only; undefined → server default (10). */
+  maxTokensPerTurn?: number;
 }
 
 export interface SessionMetrics {
@@ -133,6 +136,7 @@ function toWireConfig(c: Partial<SessionUiConfig>): Record<string, unknown> {
   if (c.temperature !== undefined) params.temperature = c.temperature;
   if (c.topP !== undefined) params.top_p = c.topP;
   if (c.topK !== undefined) params.top_k = c.topK;
+  if (c.maxTokensPerTurn !== undefined) params.max_tokens_per_turn = c.maxTokensPerTurn;
   if (Object.keys(params).length > 0) wire.params = params;
   return wire;
 }

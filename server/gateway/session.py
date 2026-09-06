@@ -351,6 +351,9 @@ class GatewaySession:
             "ws_token": token,
             "ws_url": "/v1/realtime",
             "expires_in": int(self.registry.tokens.ttl_s),
+            # doc §7: the REST response carries model/version info alongside
+            # session.created (snapshot() has it too)
+            "model": self.model,
         }
 
     def snapshot(self) -> Dict[str, Any]:

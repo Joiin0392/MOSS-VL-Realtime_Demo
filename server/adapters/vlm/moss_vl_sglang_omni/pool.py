@@ -96,8 +96,10 @@ CONFIGURE_TIMEOUT_S = 180.0
 
 # SessionConfig params sglang-omni does not understand (extra=forbid → 422).
 # Logged once per pool so a misconfigured deploy is visible, not silent.
+# NOTE: max_tokens_per_turn IS supported (tokens/second rate cap, omni
+# VideoSessionConfigure default 86400 = unthrottled) and mapped below.
 _UNSUPPORTED_PARAMS = ("top_k", "do_sample", "repetition_penalty",
-                       "max_tokens_per_turn", "frame_queue_size",
+                       "frame_queue_size",
                        "min_pixels", "max_pixels", "video_fps",
                        "min_frames", "max_frames",
                        "multi_image_max_pixels", "video_max_pixels")
@@ -318,9 +320,7 @@ class SglangOmniPool:
         if not self._warned_unsupported:
             present = [k for k in _UNSUPPORTED_PARAMS if params.get(k) is not None]
             if present:
-                log.info("sglang-omni session.configure does not support %s — ignored "
-                         "(max_tokens_per_turn server-side is a tokens/SECOND rate cap, "
-                         "default 86400 = unthrottled; not the demo's pacing knob)",
+                log.info("sglang-omni session.configure does not support %s — ignored",
                          ", ".join(present))
             self._warned_unsupported = True
 
@@ -346,6 +346,10 @@ class SglangOmniPool:
             "prompt": prompt,
             "system_prompt": system_prompt or None,
             "max_new_tokens": max(1, int(params.get("max_new_tokens") or 4096)),
+            # tokens/SECOND rate cap (omni default 86400 = unthrottled); the
+            # demo plane always supplies one (session param or server default)
+            "max_tokens_per_turn": max(0.1, float(
+                params.get("max_tokens_per_turn") or 86400.0)),
             "temperature": temperature,
             "top_p": top_p,
             "input_queue_capacity": max(1, int(self.s.sglang_omni_input_queue_capacity)),

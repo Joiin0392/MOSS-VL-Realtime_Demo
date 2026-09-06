@@ -49,4 +49,5 @@ export PYTHONUNBUFFERED=1
 cd "$REPO"
 # uvloop (ships with uvicorn[standard]) keeps the WS plane snappy under load
 exec .venv/bin/python -m uvicorn server.app:app --host 127.0.0.1 --port "${PORT:-8000}" \
-  --loop "${UVICORN_LOOP:-uvloop}"
+  --loop "${UVICORN_LOOP:-uvloop}" \
+  --ws-ping-interval "${WS_PING_INTERVAL:-20}" --ws-ping-timeout "${WS_PING_TIMEOUT:-20}"

@@ -273,7 +273,8 @@ def test_handshake_and_frame_two_phase() -> None:
         assert set(cfg) <= {"type", "prompt", "system_prompt", "max_new_tokens",
                             "max_tokens_per_turn", "temperature", "top_p",
                             "input_queue_capacity"}
-        assert "max_tokens_per_turn" not in cfg  # server default (86400) applies
+        # not supplied by the caller → omni default (86400 = unthrottled)
+        assert cfg["max_tokens_per_turn"] == 86400.0
 
         # two-phase upload: metadata → frame.ready → binary → accepted/processed
         st = session.put_frame(JPEG, timestamp=1.0)
@@ -477,9 +478,11 @@ def test_prefill_messages_configure_mapping() -> None:
         assert "assistant: 你看到了一只猫。" in payload["prompt"]
         assert payload["max_new_tokens"] == 512
         assert payload["temperature"] == 0.7 and payload["top_p"] == 0.8
+        # max_tokens_per_turn IS supported (tokens/second rate cap) and maps
+        assert payload["max_tokens_per_turn"] == 20.0
         # unsupported knobs never reach the wire (extra=forbid → 422)
         for banned in ("top_k", "do_sample", "repetition_penalty",
-                       "max_tokens_per_turn", "video_fps", "prefill_messages"):
+                       "video_fps", "prefill_messages"):
             assert banned not in payload, banned
         # do_sample=False forces greedy
         greedy = pool._configure_payload(dict(prompt="", do_sample=False, temperature=0.7))
@@ -487,6 +490,64 @@ def test_prefill_messages_configure_mapping() -> None:
         print("prefill_messages → configure mapping: OK")
     finally:
         server.close()
+
+
+class _KeepaliveFakeWS:
+    """Bare-minimum stand-in for the websocket-client socket: only what
+    SglangOmniClient._start_keepalive touches. `pong=True` simulates a peer
+    that answers pings (pong arrival bumps client._last_seen)."""
+
+    def __init__(self, client, pong: bool):
+        self._client = client
+        self._pong = pong
+        self.pings = 0
+        self.aborted = False
+
+    def ping(self) -> None:
+        self.pings += 1
+        if self._pong:
+            # the receiver thread would observe the pong frame; simulate it
+            self._client._last_seen = time.monotonic()
+
+    def abort(self) -> None:
+        self.aborted = True
+
+    def close(self) -> None:
+        pass
+
+
+def test_keepalive_aborts_on_missed_pong() -> None:
+    from server.adapters.vlm.moss_vl_sglang_omni.client import SglangOmniClient
+    client = SglangOmniClient("http://127.0.0.1:1", ping_interval_s=0.05,
+                              ping_timeout_s=0.05)
+    fake = _KeepaliveFakeWS(client, pong=False)
+    client._ws = fake
+    client._last_seen = time.monotonic()
+    client._start_keepalive()
+    try:
+        deadline = time.monotonic() + 2.0
+        while not fake.aborted and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert fake.aborted, "keepalive never aborted a peer that misses pongs"
+        assert fake.pings >= 1
+    finally:
+        client._closed.set()
+
+
+def test_keepalive_tolerates_answering_peer() -> None:
+    from server.adapters.vlm.moss_vl_sglang_omni.client import SglangOmniClient
+    client = SglangOmniClient("http://127.0.0.1:1", ping_interval_s=0.05,
+                              ping_timeout_s=0.05)
+    fake = _KeepaliveFakeWS(client, pong=True)
+    client._ws = fake
+    client._last_seen = time.monotonic()
+    client._start_keepalive()
+    try:
+        time.sleep(0.4)  # several ping cycles
+        assert not fake.aborted, "keepalive aborted a peer that answers pings"
+        assert fake.pings >= 2
+    finally:
+        client._closed.set()
 
 
 def main() -> int:
@@ -501,6 +562,8 @@ def main() -> int:
     test_pool_acquire_capacity_and_release()
     test_pool_capacity_exceeded_marks_full()
     test_prefill_messages_configure_mapping()
+    test_keepalive_aborts_on_missed_pong()
+    test_keepalive_tolerates_answering_peer()
     print("\nSGLANG-OMNI ADAPTER TEST OK")
     return 0
 

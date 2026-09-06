@@ -387,8 +387,9 @@ class Settings:
     # max_tokens_per_turn is a tokens-per-SECOND pacing knob in real_time_generate
     # (wait = 1/N - cost). Unthrottled (86400) the model free-runs narration
     # rounds, starving ASR/prefill on a single shared GPU and ballooning the KV.
-    # 20 tok/s is still ~3x faster than speech while keeping the box responsive.
-    max_tokens_per_turn: int = field(default_factory=lambda: _env_int("GEN_MAX_TOKENS_PER_TURN", 20))
+    # 10 tok/s ≈ 1.5x speech — keeps the box responsive; per-session override
+    # rides GenerationParams.max_tokens_per_turn (frontend streaming panel).
+    max_tokens_per_turn: int = field(default_factory=lambda: _env_int("GEN_MAX_TOKENS_PER_TURN", 10))
     frame_queue_size: int = field(default_factory=lambda: _env_int("FRAME_QUEUE_SIZE", 256))
     system_prompt: Optional[str] = field(default_factory=lambda: os.getenv("REALTIME_SYSTEM_PROMPT"))
     initial_prompt: str = field(default_factory=lambda: _env("REALTIME_INITIAL_PROMPT", ""))

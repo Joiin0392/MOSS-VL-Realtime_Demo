@@ -44,7 +44,11 @@ def _vlm_start_params(rt: Runtime, cfg: SessionConfig) -> Dict[str, Any]:
         temperature=params.temperature, top_k=params.top_k, top_p=params.top_p,
         do_sample=params.do_sample, repetition_penalty=params.repetition_penalty,
         max_new_tokens=params.max_new_tokens,
-        max_tokens_per_turn=s.max_tokens_per_turn, frame_queue_size=s.frame_queue_size,
+        # per-session rate cap wins; None → the server-wide default
+        max_tokens_per_turn=(params.max_tokens_per_turn
+                             if params.max_tokens_per_turn is not None
+                             else s.max_tokens_per_turn),
+        frame_queue_size=s.frame_queue_size,
         min_pixels=params.min_pixels, max_pixels=params.max_pixels,
         video_fps=params.video_fps, min_frames=params.min_frames, max_frames=params.max_frames,
         multi_image_max_pixels=params.multi_image_max_pixels,
