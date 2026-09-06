@@ -28,6 +28,16 @@ try:
 except ImportError:  # pragma: no cover — env still provisioning
     websockets = None
 
+try:
+    import transformers  # noqa: F401
+except ImportError:  # pragma: no cover
+    transformers = None
+# ^ warm the heavy import at collection time: the session's text-token mirror
+# does a LAZY `from transformers import AutoTokenizer` on the receiver thread,
+# and a cold first import (~3s) eats poll_until's 3s budget → flaky tests when
+# this file runs standalone (in full-suite runs some earlier module has
+# already paid the import).
+
 
 class FakeSglangOmniServer:
     """Speaks the sglang-omni realtime WS protocol; scriptable from the test.
@@ -220,6 +230,18 @@ class FakeSglangOmniServer:
 
     def send_delta(self, text: str, turn_id: int = 0) -> None:
         self.send_event({"type": "response.text.delta", "delta": text, "turn_id": turn_id})
+
+    def send_ping(self) -> None:
+        """Transport-level ping (what uvicorn sends every 20s server-side)."""
+        future = asyncio.run_coroutine_threadsafe(self._ws.ping(), self._loop)
+        future.result(timeout=5.0)
+
+    def kill_connection(self) -> None:
+        """Drop the live session connection (simulates the omni side dying)."""
+        async def _kill() -> None:
+            if self._ws is not None:
+                await self._ws.close()
+        asyncio.run_coroutine_threadsafe(_kill(), self._loop).result(timeout=5.0)
 
     def send_silence(self, turn_id: int = 0) -> None:
         self.send_event({"type": "response.turn.silence", "turn_id": turn_id, "seq_no": 0})
@@ -516,6 +538,79 @@ class _KeepaliveFakeWS:
         pass
 
 
+def test_server_ping_does_not_kill_session() -> None:
+    """Regression: uvicorn's 20s server-side ping must be answered and skipped,
+    not mistaken for an 'unexpected binary event' (2026-09-06 live bug: every
+    session died exactly 20s in)."""
+    server = FakeSglangOmniServer().start()
+    try:
+        pool = make_pool(server)
+        pool.load("", -1, "online_streaming")
+        session = pool.start_realtime_session(prompt="")
+        server.send_ping()
+        server.send_ping()
+        # events still flow after transport pings
+        server.send_delta("活着", turn_id=0)
+        chunks = poll_until(session, "活着")
+        assert "活着" in chunks
+        assert session.active
+        session.stop(timeout_seconds=2.0)
+        print("server ping survival: OK")
+    finally:
+        server.close()
+
+
+def test_multi_replica_failover() -> None:
+    """Two replicas, one slot each: when s1's transport dies, releasing it
+    quarantines replica 0, and the relay's fresh session must land on replica
+    1 and keep working. With BOTH replicas quarantined, NoFreeReplica — the
+    exact terminal state observed in single-replica production 2026-09-06."""
+    server_a = FakeSglangOmniServer().start()
+    server_b = FakeSglangOmniServer().start()
+    try:
+        pool = make_pool(server_a, sglang_omni_urls=f"{server_a.url},{server_b.url}")
+        pool.load("", -1, "online_streaming")
+
+        # s1 lands on replica 0 (least-loaded, ties → lowest index)
+        s1 = pool.start_realtime_session(prompt="")
+        assert server_a.configure_payload is not None
+        assert server_b.configure_payload is None
+
+        # transport dies → receiver marks the session ws_closed
+        server_a.kill_connection()
+        deadline = time.monotonic() + 5.0
+        while s1.active and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert not s1.active, "session did not notice the dead transport"
+        s1.stop(timeout_seconds=2.0)  # release replica 0 as transport dead → DOWN
+        assert pool._replicas[0].state == DOWN, pool._replicas[0].state
+
+        # the relay's replacement session must land on replica 1 and work
+        s2 = pool.start_realtime_session(prompt="")
+        assert server_b.configure_payload is not None, "relay did not fail over to replica 1"
+        server_b.send_delta("接力成功", turn_id=0)
+        assert "接力成功" in poll_until(s2, "接力成功")
+        s2.stop(timeout_seconds=2.0)  # clean release → replica 1 free again
+
+        # now kill replica 1's session too → both DOWN → NoFreeReplica
+        s3 = pool.start_realtime_session(prompt="")
+        server_b.kill_connection()
+        deadline = time.monotonic() + 5.0
+        while s3.active and time.monotonic() < deadline:
+            time.sleep(0.05)
+        s3.stop(timeout_seconds=2.0)
+        assert all(r.state == DOWN for r in pool._replicas)
+        try:
+            pool.start_realtime_session(prompt="")
+            raise AssertionError("expected NoFreeReplica with all replicas DOWN")
+        except NoFreeReplica:
+            pass
+        print("multi-replica failover: OK")
+    finally:
+        server_a.close()
+        server_b.close()
+
+
 def test_keepalive_aborts_on_missed_pong() -> None:
     from server.adapters.vlm.moss_vl_sglang_omni.client import SglangOmniClient
     client = SglangOmniClient("http://127.0.0.1:1", ping_interval_s=0.05,
@@ -562,6 +657,8 @@ def main() -> int:
     test_pool_acquire_capacity_and_release()
     test_pool_capacity_exceeded_marks_full()
     test_prefill_messages_configure_mapping()
+    test_server_ping_does_not_kill_session()
+    test_multi_replica_failover()
     test_keepalive_aborts_on_missed_pong()
     test_keepalive_tolerates_answering_peer()
     print("\nSGLANG-OMNI ADAPTER TEST OK")

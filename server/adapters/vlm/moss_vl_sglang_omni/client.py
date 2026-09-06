@@ -225,6 +225,10 @@ class SglangOmniClient:
         with self._ws.readlock:
             opcode, frame = self._ws.recv_data_frame(control_frame=True)
         self._last_seen = time.monotonic()  # any inbound frame proves liveness
+        if opcode == ABNF.OPCODE_PING:
+            # server keepalive (uvicorn pings every 20s): recv_data_frame
+            # already auto-answered with a pong — treat as liveness proof
+            return None
         if opcode == ABNF.OPCODE_PONG:
             return None
         if opcode == ABNF.OPCODE_CLOSE:
