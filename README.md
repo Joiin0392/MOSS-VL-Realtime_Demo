@@ -15,11 +15,12 @@ MOSS-VL 实时视频/语音交互 Demo，以及供外部客户端接入的薄网
 | TF 5.12.1 兼容模型 | [OpenMOSS-Team/MOSS-VL-Realtime-SGLANG](https://huggingface.co/OpenMOSS-Team/MOSS-VL-Realtime-SGLANG) | 与特化后端配套的 checkpoint、processor 和自定义代码；当前为私有仓库，需授权 |
 | 原版模型 | [OpenMOSS-Team/MOSS-VL-Realtime](https://huggingface.co/OpenMOSS-Team/MOSS-VL-Realtime) | 原始权重及 Transformers 4.57 系列参考实现，供 HF 路径使用 |
 
-2026-09-06 的配套版本为：后端 [`115b1e2`](https://github.com/fnlp-vision/sglang-omni-realtime/commit/115b1e2b7c477187a0138fe2fbac953368779a07)，TF 5.12.1 模型包 [`bcfd9cc`](https://huggingface.co/OpenMOSS-Team/MOSS-VL-Realtime-SGLANG/tree/bcfd9ccf1e9db2896ad852301cc8dde4a6349c78)，原版模型的 Query RoPE 修复 [`1e6a45b`](https://huggingface.co/OpenMOSS-Team/MOSS-VL-Realtime/commit/1e6a45b292eeaf02aa733bd3aa7b6c85214ddc86)。正式部署应固定实际使用的代码和模型 revision，而不是只记录模型名称。
+2026-09-07 的配套版本为：后端 [`22b671a`](https://github.com/fnlp-vision/sglang-omni-realtime/commit/22b671a9e46d63eaf1f80bcd6ef1f0f043cf3f82)（包含多会话 decode 限速下的 prefill 交接修复），TF 5.12.1 模型包 [`bcfd9cc`](https://huggingface.co/OpenMOSS-Team/MOSS-VL-Realtime-SGLANG/tree/bcfd9ccf1e9db2896ad852301cc8dde4a6349c78)，原版模型的 Query RoPE 修复 [`1e6a45b`](https://huggingface.co/OpenMOSS-Team/MOSS-VL-Realtime/commit/1e6a45b292eeaf02aa733bd3aa7b6c85214ddc86)。正式部署应固定实际使用的代码和模型 revision，而不是只记录模型名称。
 
 ## 本轮更新
 
 - 新增 `VLM_DEPLOY=sglang_omni`：连接独立实时推理实例，支持多副本、每副本多 slot、探活和有限故障切换。
+- 修复并发握手时健康探测清除 slot 预留的问题；已建立会话、握手预留和后端满额冷却分别计数。多会话显存构成和配置见 [VLM 显存与并发](./docs/vlm_memory_capacity.md)。
 - 修复软打断、旧输出隔离、输入错误/ACK 超时恢复，接入可协商的 `session.usage`，按实际上下文余量触发有配置前提的 Demo rollover。
 - 补齐薄网关：创建/取消清理、reset 代次隔离、旧凭证撤销、有效帧上限、心跳、健康探测、模型版本观测和对账日志。
 - 保留远端 NPU 基础设施和 HF adapter 改动；启动脚本同时支持自定义 `PYBIN` 与 WS 帧限制/心跳参数。
