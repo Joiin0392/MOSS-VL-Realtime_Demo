@@ -624,8 +624,8 @@ class HfMossVlAdapter:
         return Image.open(BytesIO(raw)).convert("RGB")
 
     @staticmethod
-    def _resolve_chat_video(payload: str) -> dict:
-        """One uploaded chat video → `{"video_path": …}` for the processor.
+    def _resolve_chat_video(payload: str) -> str:
+        """One uploaded chat video → path string for the processor.
 
         Videos are accepted ONLY as CAS handles (`sha256:<hex>` / bare 64-hex)
         minted by POST /api/media — never raw paths or inline base64, so a
@@ -633,6 +633,10 @@ class HfMossVlAdapter:
         pure path math (persistence.media.resolve_blob_path), so it works in
         VLM worker processes too; the video processor decodes the blob itself
         (torchcodec sniffs the container, the extension-less name is fine).
+
+        Returns a plain path string (not a dict) so the processor's
+        fetch_videos takes the "Single video path" branch, which decodes
+        the entire video without requiring a "segments" key.
         """
         from ....persistence.media import normalize_hash, resolve_blob_path
 
@@ -643,7 +647,7 @@ class HfMossVlAdapter:
         path = resolve_blob_path(s)
         if path is None:
             raise ValueError(f"unknown video media: {s[:19]}…")
-        return {"video_path": path}
+        return path
 
     @classmethod
     def _prepare_chat_messages(cls, req: Any) -> Tuple[list, list, list]:
