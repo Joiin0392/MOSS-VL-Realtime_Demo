@@ -390,45 +390,6 @@ def _prepare_sglang_chat(req: Any) -> Tuple[List[Dict[str, Any]], List[str], Lis
     image_data: List[str] = []
     video_data: List[str] = []
 
-    # When the current (last) user message contains a new image or video,
-    # send ONLY that message — no conversation history.  This prevents
-    # the model's self-attention from being "primed" by previous
-    # assistant responses (which describe a different image) and
-    # overwhelming the cross-attention to the current image.
-    last_msg = messages[-1] if messages else None
-    if last_msg and isinstance(last_msg.get("content"), list):
-        has_new_media = any(
-            isinstance(p, dict) and p.get("type") in ("image", "video")
-            for p in last_msg["content"]
-        )
-        if has_new_media and len(messages) > 1:
-            messages = [last_msg]
-
-    # For text-only follow-ups (no new media in the last message), replace
-    # image/video parts in previous messages with text notes so the model
-    # doesn't see vision placeholders and try to re-describe old images.
-    # The model sees "[图片]描述图片中的内容" instead of "<tool_call>描述图片中的内容".
-    # NOTE: text-only messages arrive with string content (not list), so
-    # we check both forms.
-    last_content = last_msg.get("content") if last_msg else None
-    last_has_media = False
-    if isinstance(last_content, list):
-        last_has_media = any(
-            isinstance(p, dict) and p.get("type") in ("image", "video")
-            for p in last_content
-        )
-    if not last_has_media:
-        for m in messages[:-1]:
-            content = m.get("content")
-            if isinstance(content, list):
-                m["content"] = [
-                    {"type": "text", "text": "[图片]" if p.get("type") == "image"
-                     else "[视频]" if p.get("type") == "video" else p.get("text", "")}
-                    if isinstance(p, dict) and p.get("type") in ("image", "video")
-                    else p
-                    for p in content
-                ]
-
     for m in messages:
         content = m.get("content")
         if not isinstance(content, list):
