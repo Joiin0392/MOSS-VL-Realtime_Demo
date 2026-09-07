@@ -273,10 +273,10 @@ async def _iter_sse_deltas(resp: aiohttp.ClientResponse) -> AsyncIterator[str]:
 
 def _sampling_params(p: Any) -> Dict[str, Any]:
     """Board `_build_sglang_sampling_params` parity."""
-    do_sample = bool(getattr(p, "do_sample", True))
+    do_sample = bool(getattr(p, "do_sample", False))
     return {
         "max_new_tokens": int(getattr(p, "max_new_tokens", 4096)),
-        "temperature": float(getattr(p, "temperature", 0.7)) if do_sample else 0.0,
+        "temperature": float(getattr(p, "temperature", 0.0)) if do_sample else 0.0,
         "top_p": float(getattr(p, "top_p", 0.8)),
         "top_k": int(getattr(p, "top_k", 20)),
         # `or 1.0`: the schema default is None (→ server default lives in the
@@ -310,12 +310,12 @@ def _load_template_owner(model_path: str) -> Any:
 def _resolve_image_payload(payload: str) -> str:
     """Chat image payload → something sglang's load_image accepts.
 
-    CAS handle → blob BYTES as base64 (same as the online pool's
-    _resolve_media_handles): sglang's load_image picks its file-path branch by
-    filename EXTENSION, and extension-less CAS blob paths fall through to the
-    raw-base64 branch and explode ("Non-base64 digit found"). Images are small
-    enough to ride the JSON body. data-URL / raw base64 pass through (sglang
-    decodes both natively). Videos are different — see _resolve_video_payload.
+    CAS handle → blob bytes wrapped in a ``data:`` URL: sglang's
+    ``get_image_bytes`` treats strings starting with ``/`` as file paths,
+    and raw base64 (``/9j/…``) triggers ``OSError: File name too long``.
+    Wrapping with ``data:image;base64,…`` routes through the data-URL
+    branch which decodes correctly.  data-URL payloads pass through
+    unchanged.  Videos are different — see _resolve_video_payload.
     """
     import base64
 
@@ -329,8 +329,12 @@ def _resolve_image_payload(payload: str) -> str:
         if path is None:
             raise ValueError(f"unknown image media: {s[:19]}…")
         with open(path, "rb") as f:
-            return base64.b64encode(f.read()).decode("ascii")
-    return s  # raw base64
+            return "data:image;base64," + base64.b64encode(f.read()).decode("ascii")
+    # raw base64 — wrap with data: prefix so sglang doesn't treat it as a
+    # file path (base64 often starts with "/" → OSError on open())
+    if s and not s.startswith(("http://", "https://", "file://")):
+        return "data:image;base64," + s
+    return s
 
 
 def _resolve_video_payload(payload: str) -> str:
@@ -385,6 +389,46 @@ def _prepare_sglang_chat(req: Any) -> Tuple[List[Dict[str, Any]], List[str], Lis
 
     image_data: List[str] = []
     video_data: List[str] = []
+
+    # When the current (last) user message contains a new image or video,
+    # send ONLY that message — no conversation history.  This prevents
+    # the model's self-attention from being "primed" by previous
+    # assistant responses (which describe a different image) and
+    # overwhelming the cross-attention to the current image.
+    last_msg = messages[-1] if messages else None
+    if last_msg and isinstance(last_msg.get("content"), list):
+        has_new_media = any(
+            isinstance(p, dict) and p.get("type") in ("image", "video")
+            for p in last_msg["content"]
+        )
+        if has_new_media and len(messages) > 1:
+            messages = [last_msg]
+
+    # For text-only follow-ups (no new media in the last message), replace
+    # image/video parts in previous messages with text notes so the model
+    # doesn't see vision placeholders and try to re-describe old images.
+    # The model sees "[图片]描述图片中的内容" instead of "<tool_call>描述图片中的内容".
+    # NOTE: text-only messages arrive with string content (not list), so
+    # we check both forms.
+    last_content = last_msg.get("content") if last_msg else None
+    last_has_media = False
+    if isinstance(last_content, list):
+        last_has_media = any(
+            isinstance(p, dict) and p.get("type") in ("image", "video")
+            for p in last_content
+        )
+    if not last_has_media:
+        for m in messages[:-1]:
+            content = m.get("content")
+            if isinstance(content, list):
+                m["content"] = [
+                    {"type": "text", "text": "[图片]" if p.get("type") == "image"
+                     else "[视频]" if p.get("type") == "video" else p.get("text", "")}
+                    if isinstance(p, dict) and p.get("type") in ("image", "video")
+                    else p
+                    for p in content
+                ]
+
     for m in messages:
         content = m.get("content")
         if not isinstance(content, list):
