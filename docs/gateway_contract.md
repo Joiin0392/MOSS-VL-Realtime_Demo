@@ -1,4 +1,4 @@
-# 薄网关契约与迁移（2026-09-06）
+# 薄网关接口契约
 
 范围为 `/v1/realtime`，不包含 Demo `/api/sessions` 的语音和 memory 编排。平台负责 Bearer、客户额度和限流。本层负责一次性建连凭证、粘性路由、计量与保活，断连销毁会话。
 
@@ -33,6 +33,6 @@ GATEWAY_MODEL_VERSIONS={"http://replica-a:18500":"revision-a","http://replica-b:
 
 ## 验证与部署
 
-新增回归在 `server/tests/test_gateway_lifecycle_fixes.py`，覆盖创建取消/迟到握手、有限重试、reset token、取消 reset、健康变化、模型版本、REST 竞争和实际启动脚本参数。
+`server/tests/test_gateway_lifecycle_fixes.py` 覆盖创建取消、迟到握手、有限重试、reset token、取消 reset、健康变化、模型版本、REST 竞争和启动脚本参数。
 
-部署前核对：版本标识、应用/传输帧上限、实例上限与 `SGLANG_OMNI_SESSIONS_PER_REPLICA` 一致。代码修改不会使旧进程自动加载；本轮没有重启现有服务。飞书变更以独立草稿审核后再写入。
+部署前应核对版本标识、应用与传输帧上限，并确保后端实例上限与 `SGLANG_OMNI_SESSIONS_PER_REPLICA` 一致。部署后重启相关服务，检查健康状态、版本信息和会话创建流程。

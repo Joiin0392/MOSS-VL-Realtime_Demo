@@ -206,7 +206,7 @@ curl -s http://127.0.0.1:8100/api/status           # demo 平面状态
 网关层（`server/gateway/`）与 omni 推理实例解耦，**回滚只动网关，不动 omni**：
 
 1. `git checkout <上一稳定 commit> -- server/gateway/ server/config.py`
-   （或整仓回退到上一稳定 tag/commit；注意 config.py 新增 settings 的兼容）。
+   （或整仓回退到上一稳定 tag/commit，并核对配置字段兼容性）。
 2. `bash scripts/deploy/demo.sh restart api`（重启 8100 进程加载回滚后代码）。
 3. 验证：`GET /v1/realtime/health` 正常 + 走通「建会话 → 推帧 → delta → 销毁」闭环。
 

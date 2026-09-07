@@ -1,7 +1,6 @@
-# QA 验收对照（评审文档 §8 × GATEWAY_PLAN.md §2-P6）
+# 薄网关验收清单
 
-> 依据：评审文档 §8 逐条验收要求 + GATEWAY_PLAN.md §2-P6。本文档是
-> 「每条验收条目 → 自动化测试 / 真机清单」的对照表；新增自动化用例在
+> 本文将接口验收要求对应到自动化测试和目标设备上的验证项目。测试位于
 > `server/tests/test_gateway_qa.py`（复用 test_gateway_rest.py 的
 > in-process uvicorn + FakeSglangOmniServer harness），每个用例 docstring
 > 标注对应 §8.x 条目。
@@ -37,38 +36,34 @@
 
 ## §8.3 性能稳定
 
-归 P5 压测报告（GATEWAY_PLAN.md §2-P5，回答评审文档 §7），不在本文件
-出自动化用例。压测工具：`tools/stress_realtime.py`（`--mode direct`
-直连 omni 出后端裸性能，`--mode gateway` 走 REST 建 Session + WS
-透传出网关平面数据；八维度全记录：硬件/视频输入/会话负载/并发/时延
-P50/P95/P99/稳定性/资源/容量策略）。P5 报告中每项需含
-测试条件/目标值/实际值/是否通过，产出后回填本节引用。
+使用 `tools/stress_realtime.py` 测量性能：`--mode direct` 直连推理后端，
+`--mode gateway` 通过 REST 建立会话并使用 WS 转发。
+报告应记录硬件、视频输入、会话负载、并发数、延迟 P50/P95/P99、
+稳定性、资源占用和容量策略，并列出各项测试条件、目标值与实际值。
 
-## 真机验收清单（P5 压测窗口执行）
+## 目标设备验收
 
 以下条目依赖真实模型实例 / 真实计时 / 真实部署拓扑，in-process fake
-无法覆盖，统一在 P5 压测窗口用真机执行并记录结果：
+无法覆盖，应在目标部署环境执行并记录结果：
 
 1. **真实 park 超时行为**：omni 默认 parked 超时（约 300s）期间不发任何
    输入，验证 error{response_failed} + 服务端关闭的实际时序与字段，
    及客户端收到的事件序列与 `test_qa_8_2_park_timeout_response_failed`
    的协议语义一致。
 2. **真实分辨率/FPS 组合表现**：deploy.conf 支持的分辨率 × FPS 矩阵下的
-   首帧时延、单轮时延、丢帧率（数据入 P5 报告，限制数值回填协议文档 D 节）。
+   首帧时延、单轮时延和丢帧率。
 3. **长会话稳定性**：单会话连续运行（数小时级）成功率、断开率、内存/
-   显存曲线、队列积压（数据入 P5 报告）。
+   显存曲线和队列积压。
 4. **kill 实例演练**：薄网关验证 1011 终止、故障副本隔离和健康实例新建。
    Demo 的 memory 接力另测，不作为薄网关能力承诺。
 5. **gateway 重启会话断开语义**：重启 gateway 进程，验证全部在途会话
    断开、客户端重连需重新走 REST 建 Session（gateway 平面无
-   grace/reconnect，见 GATEWAY_PLAN.md §2-P1），演练记录入 P8。
+   grace/reconnect）。
 
-## 发现的问题（P6 过程中记录）
+## 会话结束语义
 
-- ~~session.done 后的正常关闭被当作传输死亡~~ **已修复**（P6 当天）：
-  omni 在 session.done 后正常关闭时，gateway 现在按「干净结束」处理——
-  客户端收 1000、副本 slot 直接回 READY 不隔离；只有会话中途（phase ≠
-  done）的断连才走 1011 + DOWN 隔离。见
-  `server/gateway/session.py:_on_omni_close` 与
-  `test_qa_8_1_done_events` 的锁定断言；对账落库新增
-  `end_reason=session_done`（`server/gateway/metrics.py`）。
+后端在 `session.done` 后正常关闭时，客户端收到 close 1000，连接池释放
+该会话的 slot，不隔离副本，计量记录 `end_reason=session_done`。
+会话进行中的异常断连使用 close 1011，并隔离对应副本。
+相关实现为 `server/gateway/session.py:_on_omni_close`，自动化验证见
+`test_qa_8_1_done_events`。

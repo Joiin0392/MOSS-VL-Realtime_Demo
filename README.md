@@ -1,8 +1,8 @@
 # MOSS-VL Realtime Demo
 
-MOSS-VL 实时视频/语音交互 Demo，以及供外部客户端接入的薄网关。浏览器界面使用 React/Vite，服务端使用 FastAPI；实时 VLM 可以运行在独立的 SGLang-Omni 后端，也保留原有 HF worker 和远端已合入的 NPU 路径。
+MOSS-VL 实时视频/语音交互 Demo，以及供外部客户端接入的薄网关。浏览器界面使用 React/Vite，服务端使用 FastAPI；实时 VLM 支持独立的 SGLang-Omni 后端，以及 HF worker 和 NPU 部署路径。
 
-本仓库负责交互、会话编排和协议适配，**不是模型权重仓库，也不是 SGLang-Omni 推理引擎本身**。
+本仓库提供交互界面、会话编排和协议适配，模型权重与推理后端分别通过下列配套仓库安装。
 
 ## 仓库与版本
 
@@ -15,16 +15,17 @@ MOSS-VL 实时视频/语音交互 Demo，以及供外部客户端接入的薄网
 | TF 5.12.1 兼容模型 | [OpenMOSS-Team/MOSS-VL-Realtime-SGLANG](https://huggingface.co/OpenMOSS-Team/MOSS-VL-Realtime-SGLANG) | 与特化后端配套的 checkpoint、processor 和自定义代码；当前为私有仓库，需授权 |
 | 原版模型 | [OpenMOSS-Team/MOSS-VL-Realtime](https://huggingface.co/OpenMOSS-Team/MOSS-VL-Realtime) | 原始权重及 Transformers 4.57 系列参考实现，供 HF 路径使用 |
 
-2026-09-07 的配套版本为：后端 [`22b671a`](https://github.com/fnlp-vision/sglang-omni-realtime/commit/22b671a9e46d63eaf1f80bcd6ef1f0f043cf3f82)（包含多会话 decode 限速下的 prefill 交接修复），TF 5.12.1 模型包 [`bcfd9cc`](https://huggingface.co/OpenMOSS-Team/MOSS-VL-Realtime-SGLANG/tree/bcfd9ccf1e9db2896ad852301cc8dde4a6349c78)，原版模型的 Query RoPE 修复 [`1e6a45b`](https://huggingface.co/OpenMOSS-Team/MOSS-VL-Realtime/commit/1e6a45b292eeaf02aa733bd3aa7b6c85214ddc86)。正式部署应固定实际使用的代码和模型 revision，而不是只记录模型名称。
+配套版本：后端 [`22b671a`](https://github.com/fnlp-vision/sglang-omni-realtime/commit/22b671a9e46d63eaf1f80bcd6ef1f0f043cf3f82)、TF 5.12.1 模型包 [`bcfd9cc`](https://huggingface.co/OpenMOSS-Team/MOSS-VL-Realtime-SGLANG/tree/bcfd9ccf1e9db2896ad852301cc8dde4a6349c78)、HF 参考模型 [`1e6a45b`](https://huggingface.co/OpenMOSS-Team/MOSS-VL-Realtime/commit/1e6a45b292eeaf02aa733bd3aa7b6c85214ddc86)。部署时请固定代码和模型 revision，并在发布清单中记录。
 
-## 本轮更新
+## 功能
 
-- 新增 `VLM_DEPLOY=sglang_omni`：连接独立实时推理实例，支持多副本、每副本多 slot、探活和有限故障切换。
-- 修复并发握手时健康探测清除 slot 预留的问题；已建立会话、握手预留和后端满额冷却分别计数。多会话显存构成和配置见 [VLM 显存与并发](./docs/vlm_memory_capacity.md)。
-- 修复软打断、旧输出隔离、输入错误/ACK 超时恢复，接入可协商的 `session.usage`，按实际上下文余量触发有配置前提的 Demo rollover。
-- 补齐薄网关：创建/取消清理、reset 代次隔离、旧凭证撤销、有效帧上限、心跳、健康探测、模型版本观测和对账日志。
-- 保留远端 NPU 基础设施和 HF adapter 改动；启动脚本同时支持自定义 `PYBIN` 与 WS 帧限制/心跳参数。
-- 增加可直接修改的 [SGLang-Omni 最小配置](./.env.deploy.sglang-omni.example)，显式声明 `requests` 依赖，并将测试依赖独立放入 [requirements-dev.txt](./requirements-dev.txt)。
+- 视频流与文本问题输入、流式字幕、回答打断，以及可选 ASR/TTS。
+- `VLM_DEPLOY=sglang_omni` 连接独立推理实例，支持多副本、每副本多会话、健康探测和故障切换。
+- 文本与图像 memory、上下文用量观测，以及长会话 rollover。
+- REST/WS 薄网关，提供会话生命周期、一次性凭证、帧大小限制、心跳和计量。
+- HF worker 与 NPU 部署路径，可通过 `PYBIN` 指定匹配的平台环境。
+
+多会话配置和资源规划见 [VLM 显存与并发](./docs/vlm_memory_capacity.md)，最小视频/文本配置见 [.env.deploy.sglang-omni.example](./.env.deploy.sglang-omni.example)。
 
 ## 三个协议平面
 
@@ -60,7 +61,7 @@ Demo 和薄网关当前分别维护池占用计数。若两者同时共享相同
 | 离线聊天 `.venv-sglang` | [requirements-sglang.txt](./requirements-sglang.txt) | 历史离线聊天引擎，不是 realtime 后端 |
 | 可选 TTS 环境 | [requirements-vllm.txt](./requirements-vllm.txt)、[requirements-mossrt.txt](./requirements-mossrt.txt)、[requirements-cosyvoice.txt](./requirements-cosyvoice.txt) | 按所选 provider 单独安装 |
 
-CUDA quickstart 面向 Linux/NVIDIA，需兼容驱动、FFmpeg/torchcodec 所需动态库和 Node 20.19+ 或 22.12+。NPU 保留已有代码路径，但需平台匹配的 Torch/torch_npu 环境及 `PYBIN`，不要在 NPU 环境照装 CUDA wheel；本次发布不代表重新完成 NPU 端到端验收。
+CUDA quickstart 面向 Linux/NVIDIA，需兼容驱动、FFmpeg/torchcodec 所需动态库和 Node 20.19+ 或 22.12+。NPU 部署使用平台匹配的 Torch/torch_npu 环境及 `PYBIN`，不使用下方的 CUDA wheel 安装命令。
 
 ## Quickstart：SGLang-Omni + 视频/文本 Demo
 
@@ -73,7 +74,7 @@ CUDA quickstart 面向 Linux/NVIDIA，需兼容驱动、FFmpeg/torchcodec 所需
 ```bash
 git clone https://github.com/fnlp-vision/sglang-omni-realtime.git
 cd sglang-omni-realtime
-git switch --detach 115b1e2b7c477187a0138fe2fbac953368779a07
+git switch --detach 22b671a9e46d63eaf1f80bcd6ef1f0f043cf3f82
 uv venv .venv -p 3.12
 source .venv/bin/activate
 uv pip install -e .
@@ -133,7 +134,7 @@ SGLANG_OMNI_URLS=http://127.0.0.1:18500
 SGLANG_OMNI_SESSIONS_PER_REPLICA=1
 SGLANG_OMNI_CONTEXT_LENGTH=131072
 MODEL_PATH=/path/to/moss-vl-realtime-sglang
-GATEWAY_MODEL_VERSION=model-bcfd9cc_backend-115b1e2
+GATEWAY_MODEL_VERSION=model-bcfd9cc_backend-22b671a
 ```
 
 示例版本标识对应上面的固定版本；使用不同产物时应填写真实发布标识。`MODEL_PATH` 在该模式主要供 tokenizer/状态估算使用，不会在 Demo 中加载这份 5.12.1 模型。若两层不共享文件系统，应在 Demo 侧提供匹配的 tokenizer 文件。
@@ -213,7 +214,7 @@ curl --fail -X POST http://127.0.0.1:8000/v1/realtime/sessions
 
 默认创建 deadline 30 秒、token TTL 60 秒、等待 attach 90 秒。断连会销毁薄网关会话；没有 Demo 的 grace/replay。容量满与副本不可达分别返回 `session_capacity_exceeded` 和 `no_available_replica`。详细行为见[网关契约](./docs/gateway_contract.md)，运维与计量见[运行手册](./docs/ops_runbook.md)和[告警说明](./docs/gateway_alerting.md)。
 
-## 验证与发布边界
+## 测试与部署
 
 ```bash
 python -m pip install -r requirements-dev.txt
@@ -224,9 +225,9 @@ npm run build
 
 测试入口会为每个文件启动独立进程、清除部署配置并隐藏 GPU；旧脚本式套件按其原有 main 入口执行，其余使用 pytest。不要直接将这些混合入口统一当作 pytest fixtures。日志目录在结束时打印，可用 `--output-dir` 指定。
 
-`server/tests` 包含 adapter、协议、生命周期、配置和假后端测试，不等同于 GPU 模型质量、NPU 或公网平台 E2E 验收。已有真实模型/长会话测试与历史负载报告也有各自输入、版本及硬件条件，不能直接作为任意分辨率、FPS、时长和并发下的 SLA。`reports/` 保留历史开发证据，不是当前上线承诺；高压短会话完成超时仍需按最终部署条件复测。
+`server/tests` 覆盖 adapter、协议、生命周期和配置。部署验收还应在目标硬件上测试实际分辨率、FPS、并发数、长会话运行和模型回答质量。容量参考见 [VLM 显存与并发](./docs/vlm_memory_capacity.md)，接口验收见 [QA 验收清单](./docs/qa_acceptance.md)。高负载测试应分别统计输入处理完成和会话结束，覆盖短会话完成超时。
 
-代码更新后，按“模型与推理后端版本核对 -> 后端重新加载 -> Demo 重启 -> 联调验收”的顺序部署；推送 Git 不会使已有进程自动加载补丁。生产配置 `.env.deploy`、权重、环境和日志不随 Git 同步。
+部署顺序为：核对模型与后端版本、启动或重新加载后端、启动或重启 Demo、执行联调验收。运行进程在重启后加载对应版本。生产配置 `.env.deploy`、权重、环境和日志独立管理。
 
 ## 代码导航
 
@@ -236,7 +237,7 @@ npm run build
 | [server/gateway](./server/gateway/) | 独立薄网关 REST/WS、token、计量和生命周期 |
 | [server/session](./server/session/) | Demo 会话与语音/字幕编排 |
 | [server/memory](./server/memory/) | 记忆、摘要与 rollover |
-| [server/device_compat.py](./server/device_compat.py) | 远端合入的 CUDA/NPU 兼容层 |
+| [server/device_compat.py](./server/device_compat.py) | CUDA/NPU 设备兼容层 |
 | [src](./src/) | React 前端 |
 | [scripts/deploy](./scripts/deploy/) | API/web 启动与环境透传 |
 | [server/tests](./server/tests/) | 工程回归 |
