@@ -111,9 +111,14 @@ class _Replica:
     state: str = STARTING
     slots: int = 1                 # concurrent sessions this replica may host
     sessions: set = field(default_factory=set)  # live SglangOmniSessions
-    used: int = 0                  # reserved slots; ≥ len(sessions) — omni may
-                                   # report full over sessions we don't track
+    pending: int = 0               # local handshakes holding a slot
+    remote_full_until: float = 0.0  # cooldown after remote capacity rejection
     health: Dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def used(self) -> int:
+        local = len(self.sessions) + self.pending
+        return max(local, self.slots) if self.remote_full_until else local
 
 
 class _PooledSession:
@@ -179,6 +184,7 @@ class SglangOmniPool:
     def status(self) -> Dict[str, Any]:
         replicas = [
             {"url": r.url, "state": r.state, "slots": r.slots, "used": r.used,
+             "pending": r.pending, "tracked_sessions": len(r.sessions),
              "health": r.health or None}
             for r in self._replicas]
         return {
@@ -206,6 +212,7 @@ class SglangOmniPool:
                     r.health = health
                     if r.state != BUSY:
                         r.state = READY
+                    self._refresh_capacity(r)
                 else:
                     if r.state != BUSY:
                         r.state = DOWN
@@ -226,7 +233,8 @@ class SglangOmniPool:
             with self._lock:
                 picked: Optional[int] = None
                 for i, r in enumerate(self._replicas):
-                    if i not in attempted and r.state == READY and (
+                    self._refresh_capacity(r)
+                    if i not in attempted and r.state == READY and r.used < r.slots and (
                             picked is None or r.used < self._replicas[picked].used):
                         picked = i
                 if picked is None:
@@ -235,9 +243,8 @@ class SglangOmniPool:
                     raise NoFreeReplica(self.capacity, self.busy)
                 r = self._replicas[picked]
                 attempted.add(picked)
-                r.used += 1  # reserve a slot before the (slow) WS handshake
-                if r.used >= r.slots:
-                    r.state = BUSY
+                r.pending += 1
+                self._refresh_capacity(r)
             try:
                 inner = self._start_on_replica(r, params)
             except SessionCapacityExceeded:
@@ -247,8 +254,9 @@ class SglangOmniPool:
                 log.warning("sglang-omni %s at session capacity — trying next replica",
                             r.url)
                 with self._lock:
-                    r.used = r.slots
-                    r.state = BUSY
+                    r.pending -= 1
+                    r.remote_full_until = time.monotonic() + self.capacity_retry_delay_s
+                    self._refresh_capacity(r)
                     any_ready = any(i not in attempted and x.state == READY
                                     for i, x in enumerate(self._replicas))
                 if any_ready:
@@ -264,16 +272,14 @@ class SglangOmniPool:
                 time.sleep(self.capacity_retry_delay_s)
                 with self._lock:
                     for x in self._replicas:
-                        if x.state == BUSY and len(x.sessions) < x.used:
-                            # untracked remote occupancy may have torn down
-                            x.used = len(x.sessions)
-                            if x.used < x.slots:
-                                x.state = READY
+                        self._refresh_capacity(x)
                 continue
             except Exception as exc:
                 with self._lock:
-                    r.used = max(len(r.sessions), r.used - 1)  # hand the slot back
-                    r.state = (READY if r.used < r.slots else BUSY) if isinstance(exc, ValueError) else DOWN
+                    r.pending -= 1
+                    if not isinstance(exc, ValueError):
+                        r.state = DOWN
+                    self._refresh_capacity(r)
                 if isinstance(exc, ValueError):
                     raise
                 last_error = exc
@@ -281,10 +287,19 @@ class SglangOmniPool:
                 continue
             session = _PooledSession(self, picked, inner)
             with self._lock:
+                r.pending -= 1
                 r.sessions.add(inner)
+                self._refresh_capacity(r)
             log.info("session %s → sglang-omni replica %d (%s) [%d/%d slots used]",
                      inner.session_id, picked, r.url, r.used, r.slots)
             return session
+
+    def _refresh_capacity(self, replica: _Replica) -> None:
+        """Called under _lock; expiry never changes local slot ownership."""
+        if replica.remote_full_until and time.monotonic() >= replica.remote_full_until:
+            replica.remote_full_until = 0.0
+        if replica.state in (READY, BUSY):
+            replica.state = BUSY if replica.used >= replica.slots else READY
 
     def _start_on_replica(self, replica: _Replica, params: Dict[str, Any]) -> SglangOmniSession:
         payload = self._configure_payload(params)
@@ -315,13 +330,11 @@ class SglangOmniPool:
         with self._lock:
             if session is not None:
                 r.sessions.discard(session)
-            r.used = max(len(r.sessions), r.used - 1)
             if transport_dead:
                 # a dead transport means the server may be wedged — quarantine
                 # the replica until the prober's next health poll clears it
                 r.state = DOWN
-            elif r.state == BUSY and r.used < r.slots:
-                r.state = READY
+            self._refresh_capacity(r)
         log.info("sglang-omni replica %d released [%d/%d slots used]%s",
                  index, r.used, r.slots,
                  " (transport dead — quarantined)" if transport_dead else "")
@@ -393,34 +406,29 @@ class SglangOmniPool:
 
         def prober() -> None:
             while not self._prober_stop.wait(interval):
-                for i, r in enumerate(self._replicas):
-                    with self._lock:
-                        # DOWN: health recovery; BUSY with used > tracked
-                        # sessions: a capacity-rejection full mark whose
-                        # untracked remote occupancy may have drained
-                        needs_probe = r.state == DOWN or (
-                            r.state == BUSY and len(r.sessions) < r.used)
-                    if not needs_probe:
-                        continue
-                    health = self._probe_health(r.url)
-                    if health is None:
-                        continue
-                    with self._lock:
-                        r.health = health
-                        if r.state == DOWN:
-                            r.state = READY if r.used < r.slots else BUSY
-                            log.info("sglang-omni replica %d recovered (%s)", i, r.url)
-                        elif len(r.sessions) < r.used:
-                            # clear the stale full mark; a wrong clear
-                            # self-corrects on the next capacity rejection
-                            r.used = len(r.sessions)
-                            r.state = READY if r.used < r.slots else BUSY
-                            log.info("sglang-omni replica %d capacity mark cleared (%s)",
-                                     i, r.url)
+                self._probe_replicas()
 
         self._prober = threading.Thread(
             target=prober, name="sglang-omni-health", daemon=True)
         self._prober.start()
+
+    def _probe_replicas(self) -> None:
+        for i, r in enumerate(self._replicas):
+            with self._lock:
+                needs_probe = r.state == DOWN or (
+                    r.remote_full_until and time.monotonic() >= r.remote_full_until)
+            if not needs_probe:
+                continue
+            health = self._probe_health(r.url)
+            if health is None:
+                continue
+            with self._lock:
+                r.health = health
+                if r.state == DOWN:
+                    r.state = READY
+                    log.info("sglang-omni replica %d recovered (%s)", i, r.url)
+                # A newer rejection during the probe retains its own cooldown.
+                self._refresh_capacity(r)
 
 
 def _render_prefill(messages: List[Dict[str, str]]) -> tuple:
