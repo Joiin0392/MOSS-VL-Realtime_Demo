@@ -390,11 +390,29 @@ def _prepare_sglang_chat(req: Any) -> Tuple[List[Dict[str, Any]], List[str], Lis
     image_data: List[str] = []
     video_data: List[str] = []
 
-    for m in messages:
+    # The web frontend resends the WHOLE conversation (every user turn keeps
+    # its image/video parts) on every request.  Each video expands to ~20-80k
+    # tokens and its ViT activations grow linearly with the number of media
+    # items in the request — so a long multi-turn chat eventually OOMs the
+    # NPU (or exceeds the KV pool).  Only the LAST user message needs the
+    # actual media: earlier turns are already summarised in the assistant
+    # replies, so strip their media down to [图片]/[视频] text markers and
+    # keep only the newest turn's pixels.  This bounds per-request memory
+    # regardless of conversation length.
+    last_user_idx = None
+    for i in range(len(messages) - 1, -1, -1):
+        if messages[i].get("role") == "user":
+            last_user_idx = i
+            break
+
+    for idx, m in enumerate(messages):
         content = m.get("content")
         if not isinstance(content, list):
             m["content"] = content if isinstance(content, str) else str(content or "")
             continue
+        # Only the latest user turn keeps real media; older turns are reduced
+        # to text markers so the model still knows what was discussed.
+        media_stripped = (last_user_idx is not None and idx != last_user_idx)
         # pass 1: placeholders already typed in text parts suppress that many
         # auto-insertions (board's existing-token skip logic, MOSS branch)
         existing_text = "".join(
@@ -411,6 +429,9 @@ def _prepare_sglang_chat(req: Any) -> Tuple[List[Dict[str, Any]], List[str], Lis
                 continue
             ptype = part.get("type")
             if ptype == "image":
+                if media_stripped:
+                    chunks.append("[图片]")
+                    continue
                 payload = part.get("media") or part.get("image") or part.get("data") or ""
                 image_data.append(_resolve_image_payload(str(payload)))
                 if img_skip > 0:
@@ -418,6 +439,9 @@ def _prepare_sglang_chat(req: Any) -> Tuple[List[Dict[str, Any]], List[str], Lis
                 else:
                     chunks.append(IMAGE_TOKEN)
             elif ptype == "video":
+                if media_stripped:
+                    chunks.append("[视频]")
+                    continue
                 payload = part.get("media") or part.get("video") or ""
                 video_data.append(_resolve_video_payload(str(payload)))
                 if vid_skip > 0:
