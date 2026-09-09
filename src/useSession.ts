@@ -43,9 +43,6 @@ export interface SessionUiConfig {
   temperature?: number;
   topP?: number;
   topK?: number;
-  /** Generation rate cap, tokens/SECOND (omni max_tokens_per_turn).
-   *  Creation-time only; undefined → server default (4). */
-  maxTokensPerTurn?: number;
 }
 
 export interface SessionMetrics {
@@ -136,7 +133,6 @@ function toWireConfig(c: Partial<SessionUiConfig>): Record<string, unknown> {
   if (c.temperature !== undefined) params.temperature = c.temperature;
   if (c.topP !== undefined) params.top_p = c.topP;
   if (c.topK !== undefined) params.top_k = c.topK;
-  if (c.maxTokensPerTurn !== undefined) params.max_tokens_per_turn = c.maxTokensPerTurn;
   if (Object.keys(params).length > 0) wire.params = params;
   return wire;
 }
@@ -445,12 +441,10 @@ export function useSession(callbacks: UseSessionCallbacks) {
         socketRef.current = socket;
         socket.connect();
 
-        // Sampler must exist BEFORE the first await: session.created can be
-        // processed (setConnected → the App effect sends the staged image's
-        // still frame + the initial source change stamped with the session
-        // clock) while connect() is still awaiting mic setup — created after
-        // the await, it is null at that moment and sendStill() silently drops
-        // the frame (frames never reach the model → it answers <|silence|>).
+        if (stream && stream.getAudioTracks().length > 0) {
+          micRef.current = await startMicCapture(stream, (pcm) => socketRef.current?.sendMic(pcm));
+          updateMicGate();
+        }
         if (videoEl) {
           // operator-set frames/sec (streaming model param) → falls back to the
           // 1 fps default; guarded to a sane floor so the sampler never stalls.
@@ -473,10 +467,6 @@ export function useSession(callbacks: UseSessionCallbacks) {
               dedup: () => samplerProfileRef.current.dedup,
             },
           );
-        }
-        if (stream && stream.getAudioTracks().length > 0) {
-          micRef.current = await startMicCapture(stream, (pcm) => socketRef.current?.sendMic(pcm));
-          updateMicGate();
         }
         reportTimerRef.current = setInterval(() => {
           const player = playerRef.current;
