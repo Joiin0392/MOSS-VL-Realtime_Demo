@@ -16,27 +16,21 @@ The new prefill is ONE role:system message at position 0 — base prompt /
 recall-format declaration / pinned / verbatim-hold / summary / handle line —
 followed by the last `memory_rollover_tail_turns` turns verbatim as real
 user/assistant tail messages. The summary is RE-DERIVED from the full raw
-journal each rollover (never summary-of-summary) — on the pi_agent sidecar
-(provider "pi": /compact → {summary, pins}, pins join the pinned layer) or on
-the offline sglang plane (provider "offline"); any other provider or an
-absent/unloaded/failing backend degrades to verbatim-tail-only with NO error
-(1-GPU boxes have no offline plane, §7).
+journal each rollover (never summary-of-summary) on the offline sglang plane;
+provider != "offline" or an absent/unloaded/failing plane degrades to
+verbatim-tail-only with NO error (1-GPU boxes have no offline plane, §7).
 Correction detection and assembly are lexical/string-concat — no model (§7).
 """
 from __future__ import annotations
 
 import asyncio
 import re
-import threading
-import time
-from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, List, Optional, Sequence, Tuple
 
 from ..config import Settings
 from ..logging_conf import get_logger
 from ..schemas import ChatMessage, ChatRequest, GenerationParams
 from . import inject as inject_mod
-from .pi_client import PiAgentClient
 from .store import KIND_PINNED, KIND_UTTERANCE, MemoryItem, MemoryStore
 
 log = get_logger(__name__)
@@ -88,16 +82,6 @@ def _default_system_prompt() -> str:
         return _DEFAULT_SYSTEM_PROMPT_MIRROR
 
 
-@dataclass
-class _Prefetch:
-    """One background _collect + pi /compact run kicked ahead of the rollover
-    thresholds (board parity); consumed by build_prefix."""
-    done: threading.Event = field(default_factory=threading.Event)
-    status: str = "running"  # running | ready | error
-    result: Optional[Tuple[Tuple[List[MemoryItem], List[MemoryItem], List[MemoryItem]],
-                           str, List[str]]] = None  # (collected, summary, pins)
-
-
 class RolloverManager:
     """Per-session compaction planner. Construction is cheap; the orchestrator
     drives `should_rollover` (sync, hot-ish) and `build_prefix` (async, off the
@@ -107,9 +91,7 @@ class RolloverManager:
     def __init__(self, settings: Settings, store: MemoryStore, conversation_id: str,
                  *, plane: Any = None, base_system_prompt: str = "",
                  lang_getter: Optional[Callable[[], str]] = None,
-                 semaphore: Optional[asyncio.Semaphore] = None,
-                 pi: Any = None,
-                 journal_extra: Optional[Callable[[], Sequence[Tuple[str, str]]]] = None) -> None:
+                 semaphore: Optional[asyncio.Semaphore] = None) -> None:
         self.settings = settings
         self.store = store
         self.conversation_id = conversation_id
@@ -117,19 +99,10 @@ class RolloverManager:
         # the background-job semaphore with fact extraction (design §7:
         # concurrency 1-2 against the sidecar), falling back to its own
         self.plane = plane
-        # pi_agent sidecar client for memory_summary_provider == "pi"
-        # (/compact → {summary, pins}); stateless, cheap to construct
-        self.pi = pi if pi is not None else PiAgentClient(settings)
-        # interrupted (uncommitted) turns from the MemorySession — compact
-        # journal context only, never the tail (board QA-pair parity)
-        self._journal_extra = journal_extra
         self.base_system_prompt = base_system_prompt or ""
         self._lang_getter = lang_getter or (lambda: "zh")
         self._semaphore = semaphore or asyncio.Semaphore(
             max(1, int(settings.memory_bg_concurrency)))
-        # compact prefetch: one in-flight/ready background run per session
-        self._prefetch_lock = threading.Lock()
-        self._prefetch: Optional[_Prefetch] = None
 
     # ------------------------------------------------------------------ trigger
 
@@ -178,19 +151,10 @@ class RolloverManager:
         `kept_item_ids` are EXACTLY the journal ids whose content went into the
         new prefix — the orchestrator hands them to `MemorySession.note_rollover`
         so the injected set is recomputed from reality (design §5), not cleared.
-
-        A ready compact prefetch (maybe_prefetch_compact) is consumed first —
-        the seconds-long pi /compact call is normally done by the time the
-        rollover fires; a still-running one gets a bounded join (30s), and a
-        failed/empty one falls through to the synchronous path unchanged.
         """
-        cached = self._take_prefetch()
-        if cached is not None:
-            (journal, pinned, tail), summary, pins = cached
-            return self._assemble(summary, pins=pins, collected=(journal, pinned, tail))
         journal, pinned, tail = await asyncio.to_thread(self._collect)
-        summary, pins = await self._summarize_full(journal)
-        return self._assemble(summary, pins=pins, collected=(journal, pinned, tail))
+        summary = await self._summarize(journal)
+        return self._assemble(summary, collected=(journal, pinned, tail))
 
     # ------------------------------------------------------------------ internals
 
@@ -264,7 +228,6 @@ class RolloverManager:
 
     def _assemble(self, summary: Optional[str],
                   collected: Optional[Tuple[List[MemoryItem], List[MemoryItem], List[MemoryItem]]] = None,
-                  pins: Optional[Sequence[str]] = None,
                   ) -> Tuple[List[dict], List[int], int]:
         """System message = base prompt + recall declaration + pinned +
         verbatim-hold + summary + handle line, in THAT order (design §6); then
@@ -278,12 +241,6 @@ class RolloverManager:
         kept: List[int] = []
 
         pinned_lines, pinned_ids = self._budget_lines(pinned, _BUDGET_PINNED)
-        if pins:
-            # pi_agent /compact pins: the compactor's explicit keep-list —
-            # high-priority verbatim lines AHEAD of the user's store pins, and
-            # not subject to the layer budget (board parity)
-            pins_lines = [str(p).replace("\n", " ").strip() for p in pins if str(p).strip()]
-            pinned_lines = pins_lines + pinned_lines
         if pinned_lines:
             header = "置顶记忆 / Pinned:" if zh else "Pinned memories:"
             sections.append(header + "\n" + "\n".join(pinned_lines))
@@ -330,140 +287,7 @@ class RolloverManager:
     # ------------------------------------------------------------------ summary
 
     def _summary_configured(self) -> bool:
-        return (self.settings.memory_summary_provider or "") in ("offline", "pi")
-
-    async def _summarize_full(self, journal: Sequence[MemoryItem]
-                              ) -> Tuple[Optional[str], List[str]]:
-        """(summary, pins) dispatch: pi_agent /compact or the offline plane.
-        Both degrade to (None, []) → verbatim-tail-only, never an exception."""
-        if (self.settings.memory_summary_provider or "") == "pi":
-            return await asyncio.to_thread(self._summarize_pi, journal)
-        return (await self._summarize(journal)), []
-
-    def _journal_lines(self, journal: Sequence[MemoryItem]) -> List[str]:
-        """Serialize the raw journal for pi_agent /compact: sanitized (this is
-        user-authored text reaching an LLM), token-capped, with the session's
-        uncommitted (interrupted) turns appended as trailing context."""
-        lines: List[str] = []
-        used = 0
-        for item in journal:
-            text = inject_mod.sanitize_model_text(item.text).replace("\n", " ").strip()
-            if not text:
-                continue
-            who = "用户" if item.role == "user" else "助手"
-            line = f"{who}: {text}"
-            used += inject_mod.estimate_tokens(line)
-            if used > 3000:  # ~2x the design prefix; plenty for a 200-token summary
-                lines.append("…")
-                break
-            lines.append(line)
-        if self._journal_extra is not None:
-            try:
-                extra = self._journal_extra()
-            except Exception:  # noqa: BLE001
-                extra = []
-            for role, text in extra:
-                text = inject_mod.sanitize_model_text(text).replace("\n", " ").strip()
-                if text:
-                    who = "用户" if role == "user" else "助手"
-                    lines.append(f"{who}: {text} [interrupted]")
-        return lines
-
-    def _summarize_pi(self, journal: Sequence[MemoryItem]) -> Tuple[Optional[str], List[str]]:
-        """pi_agent /compact (board parity). Blocking — async callers go through
-        to_thread, the prefetch thread calls it directly. Any failure or an
-        empty summary returns (None, []) → the caller degrades to
-        verbatim-tail-only, exactly like the offline branch."""
-        lines = self._journal_lines(journal)
-        if not lines:
-            return None, []
-        try:
-            response = self.pi.compact(self.conversation_id, "\n".join(lines))
-        except Exception as exc:  # noqa: BLE001
-            log.warning("rollover pi compact failed: %s", exc)
-            return None, []
-        if response is None:
-            return None, []
-        summary = inject_mod.sanitize_model_text(str(response.get("summary") or "")).strip()
-        pins = [p for p in
-                (inject_mod.sanitize_model_text(str(pin)).replace("\n", " ").strip()
-                 for pin in (response.get("pins") or [])) if p]
-        if not summary:
-            log.warning("pi_agent /compact returned an empty summary; using verbatim tail")
-            return None, []
-        return summary, pins
-
-    # ------------------------------------------------------------------ compact prefetch
-
-    def maybe_prefetch_compact(self, text_tokens: Any) -> bool:
-        """Start a background _collect + pi /compact once text tokens cross
-        `memory_rollover_idle_tokens * memory_rollover_prefetch_ratio` (default
-        60%), so the seconds-long pi call is usually already done when the
-        rollover itself fires. pi provider only — the local offline plane stays
-        synchronous. At most one in-flight/ready prefetch per session."""
-        if (self.settings.memory_summary_provider or "") != "pi":
-            return False
-        try:
-            tokens = float(text_tokens)
-        except (TypeError, ValueError):
-            return False
-        floor = float(self.settings.memory_rollover_idle_tokens) * max(
-            0.0, float(self.settings.memory_rollover_prefetch_ratio))
-        if floor <= 0 or tokens < floor:
-            return False
-        with self._prefetch_lock:
-            existing = self._prefetch
-            # running: never double-start; ready: leave it for build_prefix
-            if existing is not None and existing.status in ("running", "ready"):
-                return False
-            self._prefetch = _Prefetch()
-        thread = threading.Thread(
-            target=self._prefetch_worker, daemon=True,
-            name=f"memory-prefetch-{self.conversation_id[-6:]}")
-        thread.start()
-        return True
-
-    def _prefetch_worker(self) -> None:
-        try:
-            collected = self._collect()
-            summary, pins = self._summarize_pi(collected[0])
-            result = (collected, summary, pins) if summary else None
-            status = "ready" if result is not None else "error"
-        except Exception as exc:  # noqa: BLE001
-            log.warning("rollover compact prefetch failed for %s: %s", self.conversation_id, exc)
-            result, status = None, "error"
-        with self._prefetch_lock:
-            prefetch = self._prefetch
-            # a consumed/replaced prefetch discards this result silently
-            if prefetch is not None and prefetch.status == "running":
-                prefetch.status = status
-                prefetch.result = result
-                prefetch.done.set()
-
-    def _take_prefetch(self) -> Optional[Tuple[Tuple[List[MemoryItem], List[MemoryItem], List[MemoryItem]],
-                                               str, List[str]]]:
-        """Consume a finished prefetch; a still-running one gets a bounded join
-        (30s) instead of a duplicated synchronous /compact call. A failed or
-        empty prefetch returns None → the synchronous path runs unchanged."""
-        deadline = time.monotonic() + 30.0
-        while True:
-            with self._prefetch_lock:
-                prefetch = self._prefetch
-            if prefetch is None or prefetch.status != "running":
-                break
-            remaining = deadline - time.monotonic()
-            if remaining <= 0 or not prefetch.done.wait(timeout=min(remaining, 0.2)):
-                if time.monotonic() >= deadline:
-                    break
-        with self._prefetch_lock:
-            prefetch = self._prefetch
-            self._prefetch = None  # consumed either way; an error may retry later
-        if prefetch is None or prefetch.status != "ready" or prefetch.result is None:
-            return None
-        log.info("rollover reusing prefetched compact for %s", self.conversation_id)
-        return prefetch.result
-
-    # ------------------------------------------------------------------ summary (offline plane)
+        return (self.settings.memory_summary_provider or "") == "offline"
 
     async def _summarize(self, journal: Sequence[MemoryItem]) -> Optional[str]:
         """One summary re-derived from the FULL raw journal, every rollover

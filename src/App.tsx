@@ -448,18 +448,16 @@ export default function App() {
   const [asrLanguage, setAsrLanguage] = useState<string>('zh');
   const [vadSensitivity, setVadSensitivity] = useState<number>(50);
   // Streaming model params for the NEXT session (创建时生效, like the prompt):
-  // fps = frames/sec the browser streams up; temperature/top_p/top_k and the
-  // tokens/sec rate cap are baked into the generation engine at session
-  // creation → the fields lock while a session is live. Defaults mirror the
-  // server (GenerationParams in server/schemas.py: 0.7 / 0.8 / 20, rate cap
-  // default 4 tok/s; frame sampler default 1 fps).
+  // fps = frames/sec the browser streams up; temperature/top_p/top_k are baked
+  // into the generation engine at session creation → the fields lock while a
+  // session is live. Defaults mirror the server (GenerationParams in
+  // server/schemas.py: 0.7 / 0.8 / 20; frame sampler default 1 fps).
   // String-backed so decimals/empties type freely; parsed+clamped at connect
   // and normalized on blur (parseParam).
   const [streamFps, setStreamFps] = useState<string>('2');
   const [temperature, setTemperature] = useState<string>('0.7');
   const [topP, setTopP] = useState<string>('0.8');
   const [topK, setTopK] = useState<string>('20');
-  const [maxTokensRate, setMaxTokensRate] = useState<string>('4');
   const parseParam = (s: string, lo: number, hi: number, fallback: number) => {
     const v = parseFloat(s);
     return Number.isFinite(v) ? Math.min(hi, Math.max(lo, v)) : fallback;
@@ -507,22 +505,10 @@ export default function App() {
   // Creation-time (locked while a session is live); each cloud option only
   // appears when the backend reports that lane (API key present at boot). When
   // one is selected, the voice select lists its voices (voice_id on the wire).
-  const [ttsEngine, setTtsEngine] = useState<'local' | 'elevenlabs' | 'minimax'>('minimax');
+  const [ttsEngine, setTtsEngine] = useState<'local' | 'elevenlabs' | 'minimax'>('local');
   const [cloudTts, setCloudTts] = useState<Partial<Record<'elevenlabs' | 'minimax', {
     ready: boolean; model?: string; voices: { voice_id: string; name: string }[];
   }>>>({});
-
-  // Engine may DEFAULT to a cloud lane (no onChange fires) — once that lane's
-  // voice registry lands, re-seat a stale voicePreset (e.g. the local 'Yuewen')
-  // to the lane's first voice, or the cloud API 2054s and the session is mute.
-  useEffect(() => {
-    if (ttsEngine === 'local') return;
-    const lane = cloudTts[ttsEngine];
-    if (!lane?.voices?.length) return;
-    if (!lane.voices.some((v) => v.voice_id === voicePreset)) {
-      setVoicePreset(lane.voices[0].voice_id);
-    }
-  }, [ttsEngine, cloudTts, voicePreset]);
 
   // New sidebar modal and search states (the scroll-rail position/index/drag
   // state lives inside each HistoryScrollRail instance)
@@ -2246,7 +2232,6 @@ export default function App() {
             temperature: parseParam(temperature, 0, 2, 0.7), // creation-time sampling
             topP: parseParam(topP, 0, 1, 0.8),
             topK: Math.round(parseParam(topK, 1, 100, 20)),
-            maxTokensPerTurn: Math.round(parseParam(maxTokensRate, 1, 500, 4)), // tokens/s rate cap
           },
           initialClock: mediaFile?.kind === 'video' ? 'media' : 'live', // a still image sits on the live clock
         });
@@ -5406,11 +5391,11 @@ export default function App() {
                   </div>
                 </div>
 
-                {/* Streaming model params: fps · temperature · top_p · top_k ·
-                    tokens/s rate cap. Creation-time — the fields lock while a
-                    session is live (same as the system prompt), applied on the
-                    next connect. fps drives the client frame sampler; the rest
-                    ride the session's `params`. */}
+                {/* Streaming model params (2×2): fps · temperature · top_p ·
+                    top_k. Creation-time — the fields lock while a session is
+                    live (same as the system prompt), applied on the next
+                    connect. fps drives the client frame sampler; the three
+                    sampling params ride the session's `params`. */}
                 <div className="panel-group-title">{language === 'en' ? 'Streaming Model Parameters' : '流式模型参数'}</div>
                 <div className={`panel-group-card${streamConnected ? ' locked' : ''}`}>
                   <div className="param-grid-2x2">
@@ -5455,17 +5440,6 @@ export default function App() {
                         value={topK} disabled={streamConnected}
                         onChange={(e) => setTopK(e.target.value)}
                         onBlur={() => setTopK(String(Math.round(parseParam(topK, 1, 100, 20))))}
-                        title={streamConnected ? (language === 'en' ? 'Locked while live — applies next call' : '会话中锁定 — 下次连线生效') : undefined}
-                      />
-                    </div>
-                    <div className="param-cell">
-                      <label>{language === 'en' ? 'Rate (tokens/s)' : '限速 tokens/s'}</label>
-                      <input
-                        type="number" className="liquid-number"
-                        min="1" max="500" step="1"
-                        value={maxTokensRate} disabled={streamConnected}
-                        onChange={(e) => setMaxTokensRate(e.target.value)}
-                        onBlur={() => setMaxTokensRate(String(Math.round(parseParam(maxTokensRate, 1, 500, 4))))}
                         title={streamConnected ? (language === 'en' ? 'Locked while live — applies next call' : '会话中锁定 — 下次连线生效') : undefined}
                       />
                     </div>

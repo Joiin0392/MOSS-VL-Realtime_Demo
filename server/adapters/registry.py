@@ -77,11 +77,6 @@ def build_tts(settings: Settings, plan: Optional[object] = None):
 
 def build_vlm(settings: Settings, plan: Optional[object] = None):
     deploy = settings.vlm_deploy.strip().lower()
-    if deploy == "sglang_omni":
-        # remote sglang-omni realtime servers; no placement plan, no local workers
-        from .vlm.moss_vl_sglang_omni.pool import SglangOmniPool
-
-        return SglangOmniPool(settings)
     if deploy == "workers" and plan is not None and getattr(plan, "workers", None):
         from .vlm.moss_vl_hf.online_pool import VlmReplicaPool
 

@@ -1,8 +1,6 @@
 # MOSS-VL-Realtime_Demo_App backend — OFFLINE-CHAT ENGINE environment (.venv-sglang)
-# This is NOT the realtime sglang-omni backend environment. For realtime use
-# https://github.com/fnlp-vision/sglang-omni-realtime and its pyproject.toml.
 #
-# The offline chat plane (server/adapters/vlm/moss_vl_sglang/) serves the
+# The offline chat plane (server/adapters/vlm_offline_sglang.py) serves the
 # OFFLINE checkpoint through `sglang.launch_server` sidecars. MOSS-VL
 # (model_type "moss_vl") is NOT servable by stock sglang — its transformers
 # fallback is text-only — it requires the fnlp-vision FORK (v0.5.5.post3),

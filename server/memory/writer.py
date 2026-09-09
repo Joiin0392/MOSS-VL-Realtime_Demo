@@ -51,23 +51,8 @@ class MemoryWriter:
         self._q: "queue.Queue[Optional[Dict[str, Any]]]" = queue.Queue(maxsize=512)
         self._thread: Optional[threading.Thread] = None
         self._frames: Dict[str, _FrameState] = {}
-        # conversation_id -> set((role, whitespace-normalized text)): rollover /
-        # repeated output must not store the same utterance twice (board parity);
-        # pinned items never pass through here and are unaffected
-        self._seen_utterances: Dict[str, set] = {}
-        self._seen_lock = threading.Lock()
         self._stopping = False
         self.stats = {"utterances": 0, "frames_kept": 0, "frames_skipped": 0, "dropped": 0}
-
-    def _mark_utterance_seen(self, conversation_id: str, role: str, text: str) -> bool:
-        """True on first sight, False on an exact duplicate (whitespace-normalized)."""
-        marker = (str(role), " ".join(str(text).split()))
-        with self._seen_lock:
-            seen = self._seen_utterances.setdefault(str(conversation_id), set())
-            if marker in seen:
-                return False
-            seen.add(marker)
-            return True
 
     # ---- lifecycle ----
 
@@ -114,10 +99,6 @@ class MemoryWriter:
                        importance: float = 0.5) -> None:
         text = (text or "").strip()
         if not text:
-            return
-        if not self._mark_utterance_seen(conversation_id, role, text):
-            log.debug("dropped duplicate %s utterance for %s: %r",
-                      role, conversation_id, text[:60])
             return
         self._put({"t": "utterance", "conv": conversation_id, "role": role, "text": text,
                    "lang": lang, "session_ts": session_ts, "media_ts": media_ts,
@@ -236,5 +217,3 @@ class MemoryWriter:
 
     def forget(self, conversation_id: str) -> None:
         self._frames.pop(conversation_id, None)
-        with self._seen_lock:
-            self._seen_utterances.pop(conversation_id, None)

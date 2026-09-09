@@ -6,24 +6,11 @@ from __future__ import annotations
 
 import dataclasses
 import sys
-from unittest.mock import patch
 
 from server.config import Settings
 from server.gpu.kv_budget import KvBudget, compute_kv_budget, kv_bytes_per_token
-from server.gpu.placement import offline_gpu_count, plan_placement as _plan_placement, format_plan
-from server.gpu.topology import GpuInfo, parse_smi_csv, select_attn_impl as _select_attn_impl
-
-
-def plan_placement(topology, settings):
-    # These fixtures describe CUDA hardware, independently of the test host.
-    with patch("server.gpu.placement._device_str", new=lambda index: f"cuda:{index}"), \
-         patch("server.gpu.topology.is_npu", return_value=False):
-        return _plan_placement(topology, settings)
-
-
-def select_attn_impl(*args):
-    with patch("server.gpu.topology.is_npu", return_value=False):
-        return _select_attn_impl(*args)
+from server.gpu.placement import offline_gpu_count, plan_placement, format_plan
+from server.gpu.topology import GpuInfo, parse_smi_csv, select_attn_impl
 
 MIB = 2**20
 
@@ -89,9 +76,9 @@ def test_placement_h200() -> None:
     assert [o.gpu_index for o in plan.offline] == [6, 7]
     assert [o.port for o in plan.offline] == [30800, 30801]
     assert plan.asr_device == "cuda:5"
-    assert len(plan.tts) == 4  # native provider: one per online GPU, capped at 4
-    assert [t.gpu_index for t in plan.tts] == [5, 4, 3, 2]
-    assert [t.port for t in plan.tts] == [18100, 18101, 18102, 18103]
+    assert len(plan.tts) == 3  # ceil(6/2)
+    assert [t.gpu_index for t in plan.tts] == [5, 4, 3]
+    assert [t.port for t in plan.tts] == [18100, 18101, 18102]
     assert not plan.warnings
     format_plan(plan)  # must not raise
     print("placement 8xH200: OK")
@@ -107,7 +94,7 @@ def test_placement_blackwell() -> None:
     assert plan.offline_capacity == 1
     assert plan.offline[0].gpu_index == 1 and plan.offline[0].port == 30800
     assert plan.asr_device == "cuda:0"
-    assert len(plan.tts) == 2 and all(t.gpu_index == 0 for t in plan.tts)
+    assert len(plan.tts) == 1 and plan.tts[0].gpu_index == 0
     print("placement 2xRTX6000: OK")
 
 
@@ -120,8 +107,7 @@ def test_placement_4090() -> None:
     assert plan.workers[0].attn_impl == "flash_attention_2"
     assert plan.offline == ()
     assert plan.asr_device == "cuda:0"
-    assert len(plan.tts) == 2 and all(t.gpu_index == 0 for t in plan.tts)
-    assert [t.port for t in plan.tts] == [18100, 18101]
+    assert len(plan.tts) == 1 and plan.tts[0].gpu_index == 0 and plan.tts[0].port == 18100
     print("placement 1x4090: OK")
 
 

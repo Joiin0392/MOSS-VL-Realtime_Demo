@@ -32,35 +32,11 @@ from ..logging_conf import get_logger
 from . import inject as inject_mod
 from . import lang as lang_mod
 from . import rewrite as rewrite_mod
-from .pi_client import PiAgentClient
 from .retrieval import Candidate, Retriever
 from .store import KIND_FRAME, KIND_UTTERANCE, MemoryStore
 from .writer import MemoryWriter
 
 log = get_logger(__name__)
-
-# Retrospective question markers (board parity): loosen the hybrid prefilter
-# for questions that clearly refer backwards ("刚才说的…", "还记得那台…").
-_RETRO_QUESTION_PATTERNS = (
-    "刚才",
-    "之前",
-    "是不是",
-    "有没有",
-    "记得",
-    "还记得",
-    "那会儿",
-    "那台",
-    "那个",
-    "那时候",
-)
-# board runs its retro prefilter 0.10 below the normal one (0.75 vs 0.65)
-_RETRO_PREFILTER_RELAX = 0.10
-
-_RECENT_TURNS_FOR_DECIDE = 8
-
-
-def is_retro_question(text: str) -> bool:
-    return any(pattern in (text or "") for pattern in _RETRO_QUESTION_PATTERNS)
 
 
 @dataclass
@@ -104,14 +80,6 @@ class MemorySession:
         self._last_frame_at = 0.0
         self._prefetch: Optional[Tuple[str, List[Candidate]]] = None
         self._lock = threading.Lock()
-        # pi_agent sidecar client (decide gate + compact provider); the decide
-        # gate only engages for memory_decision_mode llm/hybrid AND a reachable
-        # pi — everything else degrades to the local-vector behavior
-        self._pi = PiAgentClient(settings)
-        # interrupted assistant turns (commit=False): they occupied KV and are
-        # compact-journal context, but a truncated answer never lands in the
-        # long-term store. Drained by the rollover journal via uncommitted_turns.
-        self._uncommitted: List[Tuple[str, str]] = []
         # internal text-KV estimate, used only when the orchestrator does not
         # pass the worker's exact count (keeps the distance gate testable and
         # self-contained): noted turns + injected blocks, in estimate_tokens
@@ -149,28 +117,15 @@ class MemorySession:
             lang=lang_mod.detect_lang(text, default=self.language),
             session_ts=self.session_ts(session_ts), media_ts=media_ts, importance=0.65)
 
-    def note_assistant_turn(self, text: str, *, media_ts: Optional[float] = None,
-                            commit: bool = True) -> None:
+    def note_assistant_turn(self, text: str, *, media_ts: Optional[float] = None) -> None:
         text = (text or "").strip()
         if not text:
             return
         self._est_tokens += inject_mod.estimate_tokens(text)
-        if not commit:
-            # barge-in / <|eot_id|> truncated turn: the text DID occupy KV and
-            # stays available as compact-journal context (uncommitted_turns),
-            # but a half-finished answer must never enter long-term memory
-            with self._lock:
-                self._uncommitted.append(("assistant", text))
-            return
         self.writer.note_utterance(
             self.conversation_id, "assistant", text,
             lang=lang_mod.detect_lang(text, default=self.language),
             session_ts=self.session_ts(), media_ts=media_ts, importance=0.4)
-
-    def uncommitted_turns(self) -> List[Tuple[str, str]]:
-        """(role, text) interrupted turns kept as compact context only."""
-        with self._lock:
-            return list(self._uncommitted)
 
     def note_frame(self, jpeg: bytes, timestamp: Optional[float] = None,
                    media_ts: Optional[float] = None) -> None:
@@ -220,47 +175,6 @@ class MemorySession:
             query = rewrite_mod.augment_query(text, texts)
         return query, window
 
-    # ---- pi_agent decide gate (memory_decision_mode llm/hybrid) ----
-
-    def _recent_turns_text(self, limit: int = _RECENT_TURNS_FOR_DECIDE) -> str:
-        """Chronological "role: text" lines from the store — the /decide context."""
-        try:
-            recent = self.store.recent(self.conversation_id, [KIND_UTTERANCE], limit=limit)
-        except Exception:  # noqa: BLE001
-            return ""
-        return "\n".join(f"{item.role or 'user'}: {item.text}"
-                         for item in reversed(recent) if item.text)
-
-    def _pi_decide(self, query: str) -> Optional[Dict[str, Any]]:
-        """Ask pi_agent /decide; None = unreachable/failed → caller degrades to
-        the local-vector behavior, never blocking the turn."""
-        pi = self._pi
-        if pi is None or not pi.reachable():
-            return None
-        return pi.decide(self.conversation_id, self._recent_turns_text(), query)
-
-    def _prefilter_gate(self, query: str) -> float:
-        """Hybrid stage-1 threshold; retrospective questions run looser (board
-        0.75 normal / 0.65 retro)."""
-        gate = float(self.settings.memory_retrieval_prefilter_score)
-        if is_retro_question(query):
-            gate -= _RETRO_PREFILTER_RELAX
-        return gate
-
-    def _hybrid_decide(self, query: str, candidates: List[Candidate]) -> bool:
-        """Stage 1: the best ABSOLUTE raw score must clear the prefilter before
-        pi is consulted at all. Stage 2: pi /decide confirms. Pi unreachable or
-        a failed decide both degrade to pure vector behavior (proceed)."""
-        pi = self._pi
-        if pi is None or not pi.reachable():
-            return True
-        if max((c.raw for c in candidates), default=0.0) < self._prefilter_gate(query):
-            return False
-        decision = pi.decide(self.conversation_id, self._recent_turns_text(), query)
-        if decision is None:
-            return True
-        return bool(decision.get("retrieve"))
-
     def recall_for_turn(self, text: str, *, now_tokens: Optional[float] = None) -> RecallResult:
         """Blocking (call via to_thread): rewrite → search → rank → time window
         → re-injection distance gate → diversify → admission gate → format.
@@ -280,23 +194,8 @@ class MemorySession:
         self._pending_block_tokens = 0
         try:
             search_q, window = self._prepare_query(query)
-            mode = (self.settings.memory_decision_mode or "vector").strip().lower()
-            if mode == "llm":
-                # pi /decide gates the whole turn; a retrieve=false verdict
-                # skips recall, a query rewrite overrides the search query
-                decision = self._pi_decide(query)
-                if decision is not None:
-                    if not decision.get("retrieve"):
-                        self.stats["gated_out"] += 1
-                        return EMPTY_RECALL
-                    override = str(decision.get("query") or "").strip()
-                    if override:
-                        search_q = override
             candidates = self._candidates(search_q)
             if not candidates:
-                return EMPTY_RECALL
-            if mode == "hybrid" and not self._hybrid_decide(query, candidates):
-                self.stats["gated_out"] += 1
                 return EMPTY_RECALL
             candidates = self._time_gate(candidates, window)
             candidates = self._distance_gate(candidates, self._est_tokens)
@@ -463,10 +362,6 @@ class MemorySession:
                           for i in kept_item_ids}
         self._est_tokens = max(0.0, float(text_tokens))
         self._pending_block_tokens = 0
-        with self._lock:
-            # the interrupted-turn buffer was part of the compacted journal;
-            # the new prefix already carries it — start fresh
-            self._uncommitted.clear()
 
     def suppress(self, ids: Sequence[int]) -> None:
         """User said 'not that one' — stop surfacing these for this session."""

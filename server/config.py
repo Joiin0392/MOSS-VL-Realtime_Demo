@@ -263,58 +263,6 @@ class Settings:
     # (pool/manager/WS tests on boxes that cannot fit N model replicas)
     vlm_worker_fake: bool = field(default_factory=lambda: _env_flag("VLM_WORKER_FAKE", False))
 
-    # ---- sglang-omni remote realtime backend (VLM_DEPLOY=sglang_omni) ----
-    # adapters/vlm/moss_vl_sglang_omni/: the realtime VLM lives on remote
-    # sglang-omni servers; no local worker processes are spawned in this mode.
-    # comma-separated http base URLs, one replica per entry; empty = unconfigured
-    sglang_omni_urls: str = field(default_factory=lambda: _env("SGLANG_OMNI_URLS", ""))
-    # concurrent realtime sessions each remote replica may host (pool slots per
-    # replica). MUST equal the remote omni instance's --max-running-requests
-    # (deploy.conf MAX_RUNNING_REQUESTS): single-GPU KV pool ÷ N = per-session
-    # safe context, so keep 1 until the P5 load test establishes a safe N.
-    sglang_omni_sessions_per_replica: int = field(
-        default_factory=lambda: _env_int("SGLANG_OMNI_SESSIONS_PER_REPLICA", 1))
-    # server-side in-flight input slots; full → the gateway waits briefly then
-    # drops PURE frames (prompts never drop)
-    sglang_omni_input_queue_capacity: int = field(
-        default_factory=lambda: _env_int("SGLANG_OMNI_INPUT_QUEUE_CAPACITY", 4))
-    # how long a pure frame waits for an input credit before being dropped
-    sglang_omni_input_drop_wait_seconds: float = field(
-        default_factory=lambda: _env_float("SGLANG_OMNI_INPUT_DROP_WAIT_SECONDS", 0.5))
-    sglang_omni_connect_timeout_s: float = field(
-        default_factory=lambda: _env_float("SGLANG_OMNI_CONNECT_TIMEOUT_S", 10.0))
-    # Older backends without negotiated usage need a conservative token budget.
-    sglang_omni_context_length: int = field(
-        default_factory=lambda: _env_int("SGLANG_OMNI_CONTEXT_LENGTH", 131072))
-    sglang_omni_fallback_frame_tokens: int = field(
-        default_factory=lambda: _env_int("SGLANG_OMNI_FALLBACK_FRAME_TOKENS", 2048))
-    sglang_omni_context_reserve_tokens: int = field(
-        default_factory=lambda: _env_int("SGLANG_OMNI_CONTEXT_RESERVE_TOKENS", 4096))
-    # DOWN-replica re-probe cadence (capacity-exceeded quarantine / health recovery)
-    sglang_omni_health_interval_s: float = field(
-        default_factory=lambda: _env_float("SGLANG_OMNI_HEALTH_INTERVAL_S", 10.0))
-
-    # ---- gateway plane (server/gateway/): thin passthrough in front of sglang-omni ----
-    # one-shot token binding a created session to its WSS attach
-    gateway_ws_token_ttl_s: float = field(
-        default_factory=lambda: _env_float("GATEWAY_WS_TOKEN_TTL_S", 60.0))
-    # a created session that no client attaches to within this window is destroyed
-    gateway_attach_timeout_s: float = field(
-        default_factory=lambda: _env_float("GATEWAY_ATTACH_TIMEOUT_S", 90.0))
-    # Both layers enforce their own cap; advertise the smaller effective limit.
-    # The gateway terminates oversized-frame sessions with error + close 1009.
-    gateway_max_frame_bytes: int = field(
-        default_factory=lambda: _env_int("GATEWAY_MAX_FRAME_BYTES", 32 * 1024 * 1024))
-    gateway_create_timeout_s: float = field(
-        default_factory=lambda: _env_float("GATEWAY_CREATE_TIMEOUT_S", 30.0))
-    gateway_model_version: str = field(
-        default_factory=lambda: _env("GATEWAY_MODEL_VERSION", ""))
-    gateway_model_versions: str = field(
-        default_factory=lambda: _env("GATEWAY_MODEL_VERSIONS", "{}"))
-    # per-session reconciliation ledger (P3): one JSONL record per session
-    # teardown; "" → {data_dir}/gateway_usage.jsonl
-    gateway_usage_log: str = field(default_factory=lambda: _env("GATEWAY_USAGE_LOG", ""))
-
     # ---- offline chat backend (sglang sidecars; adapters/vlm/moss_vl_sglang/adapter.py) ----
     # The GPU fleet splits online/offline: offline gets round(n * ratio) of the
     # eligible GPUs (min 1 when n >= 2, never all of them, 0 on 1-GPU boxes), so
@@ -408,9 +356,8 @@ class Settings:
     # max_tokens_per_turn is a tokens-per-SECOND pacing knob in real_time_generate
     # (wait = 1/N - cost). Unthrottled (86400) the model free-runs narration
     # rounds, starving ASR/prefill on a single shared GPU and ballooning the KV.
-    # 4 tok/s keeps long sessions light on KV/ASR starvation; per-session override
-    # rides GenerationParams.max_tokens_per_turn (frontend streaming panel).
-    max_tokens_per_turn: int = field(default_factory=lambda: _env_int("GEN_MAX_TOKENS_PER_TURN", 4))
+    # 20 tok/s is still ~3x faster than speech while keeping the box responsive.
+    max_tokens_per_turn: int = field(default_factory=lambda: _env_int("GEN_MAX_TOKENS_PER_TURN", 20))
     frame_queue_size: int = field(default_factory=lambda: _env_int("FRAME_QUEUE_SIZE", 256))
     system_prompt: Optional[str] = field(default_factory=lambda: os.getenv("REALTIME_SYSTEM_PROMPT"))
     initial_prompt: str = field(default_factory=lambda: _env("REALTIME_INITIAL_PROMPT", ""))
@@ -797,38 +744,13 @@ class Settings:
         default_factory=lambda: _env_float("MEMORY_ROLLOVER_MIN_PROGRESS", 0.10))
     memory_rollover_tail_turns: int = field(
         default_factory=lambda: _env_int("MEMORY_ROLLOVER_TAIL_TURNS", 6))
-    # summary + fact extraction run on the offline sglang plane ("offline"), on
-    # the pi_agent sidecar ("pi": journal -> POST {MEMORY_PI_URL}/compact ->
-    # {summary, pins}); "none" degrades rollover to verbatim-tail-only and facts
-    # to off (1-GPU boxes have no offline plane)
+    # summary + fact extraction run on the offline sglang plane; "none" degrades
+    # rollover to verbatim-tail-only and facts to off (1-GPU boxes have no
+    # offline plane)
     memory_summary_provider: str = field(
         default_factory=lambda: _env("MEMORY_SUMMARY_PROVIDER", "offline"))
     memory_summary_max_tokens: int = field(
         default_factory=lambda: _env_int("MEMORY_SUMMARY_MAX_TOKENS", 200))
-    # pi_agent memory sidecar (board parity): an HTTP service that LLM-gates
-    # retrieval (/decide) and compacts the rollover journal (/compact). An
-    # unreachable or failing pi degrades every dependent path to the
-    # local-vector / verbatim-tail behavior — never a broken turn.
-    memory_pi_url: str = field(default_factory=lambda: _env("MEMORY_PI_URL", "http://127.0.0.1:38080"))
-    memory_pi_decide_timeout_s: float = field(
-        default_factory=lambda: _env_float("MEMORY_PI_DECIDE_TIMEOUT_S", 8.0))
-    memory_pi_compact_timeout_s: float = field(
-        default_factory=lambda: _env_float("MEMORY_PI_COMPACT_TIMEOUT_S", 120.0))
-    # retrieval decision gate ahead of MemorySession.recall_for_turn:
-    #   vector — local score gates only (pre-pi behavior);
-    #   llm    — pi /decide every turn (recent_turns + the current user text);
-    #   hybrid — local raw-score prefilter first, pi /decide only confirms what
-    #            passes (retrospective questions get a loosened prefilter).
-    memory_decision_mode: str = field(default_factory=lambda: _env("MEMORY_DECISION_MODE", "hybrid"))
-    # hybrid stage-1: the best ABSOLUTE raw cosine/maxsim must clear this before
-    # pi /decide is consulted (board's 0.75; retro questions run 0.10 looser)
-    memory_retrieval_prefilter_score: float = field(
-        default_factory=lambda: _env_float("MEMORY_RETRIEVAL_PREFILTER_SCORE", 0.75))
-    # rollover compact prefetch: once text tokens cross idle_tokens * ratio, a
-    # background thread pre-runs the pi /compact so build_prefix usually finds
-    # it ready (in-flight join capped at 30s; pi provider only)
-    memory_rollover_prefetch_ratio: float = field(
-        default_factory=lambda: _env_float("MEMORY_ROLLOVER_PREFETCH_RATIO", 0.6))
     # facts are extracted from user turns only (assistant turns may interpret an
     # elliptical user turn as context, never become facts) and go into the index
     # key, never to the model

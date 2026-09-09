@@ -6,9 +6,6 @@
 # version-incompatible sidecars (sglang 0.5.10 pins torch 2.9.1 + transformers 5.3.0,
 # while the MOSS-VL streaming processor code targets transformers 4.57.x).
 # See requirements-sglang.txt for the offline-chat inference sidecar env.
-# VLM_DEPLOY=sglang_omni uses an external realtime server. Install that server
-# from https://github.com/fnlp-vision/sglang-omni-realtime in its OWN environment
-# (SGLang 0.5.16 / Transformers 5.12.1 / torch 2.11). Do not merge its pins here.
 # See requirements-vllm.txt for the vLLM-Omni TTS engine env (.venv-vllm,
 # TTS_PROVIDER=vllm_omni): its vllm/torch pins
 # also conflict with this env, so it installs from ../wheelhouse/vllm-omni
@@ -51,7 +48,6 @@ pydantic>=2.7
 python-multipart>=0.0.9
 websockets>=12.0
 websocket-client>=1.8          # outbound WS client (OpenAI-realtime-style ASR engines)
-requests>=2.32,<3              # direct dependency: omni health/model queries and memory clients
 aiohttp>=3.9                   # async HTTP client for TTS/ASR sidecar adapters
 
 # --- media / audio ---

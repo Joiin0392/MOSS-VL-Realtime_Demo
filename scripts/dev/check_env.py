@@ -50,7 +50,7 @@ SHELL_ONLY = {
     "WEB_PORT": "vite preview port (the ONE port to expose; default 20941)",
     "PORT": "backend api port (loopback only; default 8000)",
     "LOG_ROOT": "in-repo log tree root (default <repo>/logs)",
-    "PYBIN": "API/rotating_tee interpreter (default <repo>/.venv/bin/python)",
+    "PYBIN": "rotating_tee interpreter (default <repo>/.venv/bin/python)",
     "FFMPEG_LIBS": "vendored FFmpeg .so dir for torchcodec (default <repo>/.venv/lib/ffmpeg)",
     "BUILD_LOG": "vite build-watcher log (default <repo>/logs/stdout/web/build.log)",
     "API_WAIT_S": "demo.sh api health-gate budget (default 600)",
@@ -59,9 +59,6 @@ SHELL_ONLY = {
     "DEMO_SKIP_GPU": "1 = CPU-only bring-up (frontend work; VLM won't load)",
     "TTS_PORT": "demo.sh down: first TTS sidecar port to sweep (default 18100)",
     "UVICORN_LOOP": "uvicorn event loop (default uvloop)",
-    "WS_MAX_SIZE": "WebSocket transport limit in bytes (default twice GATEWAY_MAX_FRAME_BYTES)",
-    "WS_PING_INTERVAL": "WebSocket ping interval in seconds (default 20)",
-    "WS_PING_TIMEOUT": "WebSocket ping timeout in seconds (default 20)",
     "WATCH_POLL": "1 = polling vite build watcher (load-bearing on shared FS)",
     "WEB_NVM_NODE": "machine-dependent nvm version/alias for the web window (run_web.sh); set on boxes whose system Node is too old for Vite (Blackwell: 22); unset = no-op",
     "VITE_BACKEND_ORIGIN": "vite dev/preview /api proxy target (default http://127.0.0.1:8000)",
@@ -216,8 +213,8 @@ PREAMBLE = """\
 #   4. code defaults      server/config.py (single source of defaults)
 #
 # .env.deploy itself is gitignored — it describes ONE box, not the project.
-# Paths shown with <repo> are documentation placeholders, not shell variables.
-# Replace them with absolute paths when enabling an override.
+# Only needed when this checkout does NOT sit on the usual shared-GPFS layout
+# (all defaults below assume the /inspire GPFS paths).
 #
 # ============ the roots almost everything hangs off ============
 #
@@ -262,8 +259,7 @@ def gen_example(config_pairs, reader_pairs, defaults) -> str:
             if name in DYNAMIC:
                 chunks.append(f"#export {name}=        # {DYNAMIC[name]}\n")
             else:
-                value = defaults.get(name, '').replace(REPO, '<repo>')
-                chunks.append(f"#export {name}={value}\n")
+                chunks.append(f"#export {name}={defaults.get(name, '')}\n")
     chunks.append("\n# ============ direct readers (bypass Settings; see the file) ============\n")
     for rel, name in reader_pairs:
         if name in INTERNAL or any(name == n for _, n in config_pairs):

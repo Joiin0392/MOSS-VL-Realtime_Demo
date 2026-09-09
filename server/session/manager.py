@@ -131,8 +131,6 @@ class SessionManager:
                             plane=self._memory_plane,
                             base_system_prompt=config.system_prompt or "",
                             lang_getter=lambda m=memory: m.language,
-                            # interrupted turns ride the compact journal only
-                            journal_extra=lambda m=memory: m.uncommitted_turns(),
                             # share the background-job semaphore with fact
                             # extraction (design §7: concurrency 1-2 on the sidecar)
                             semaphore=getattr(self._memory_facts, "semaphore", None))

@@ -31,9 +31,6 @@ class GenerationParams(BaseModel):
     # The frontend never sends this; an explicit request value still wins.
     repetition_penalty: Optional[float] = None
     max_new_tokens: int = 4096
-    # tokens-per-SECOND generation rate cap; None → server default
-    # (Settings.max_tokens_per_turn ← GEN_MAX_TOKENS_PER_TURN, default 4)
-    max_tokens_per_turn: Optional[int] = None
     min_pixels: Optional[int] = None
     max_pixels: Optional[int] = None
     video_fps: Optional[float] = None

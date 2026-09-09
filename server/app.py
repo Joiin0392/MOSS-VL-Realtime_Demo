@@ -26,7 +26,7 @@ from .gpu.placement import format_plan, plan_placement
 from .gpu.supervisor import SglangSidecarSupervisor, TtsSidecarPool, VlmWorkerSupervisor
 from .gpu.topology import probe_topology
 from .logging_conf import configure_logging, get_logger
-from .routers import chat, history, media, ops, session_ws, sessions, speech
+from .routers import chat, history, media, openai, ops, session_ws, sessions, speech
 
 log = get_logger(__name__)
 
@@ -39,24 +39,6 @@ async def lifespan(app: FastAPI):
     configure_logging()
     log.info("Starting MOSS-Realtime backend (deploy=%s, capture_mode=%s)",
              settings.vlm_deploy, settings.capture_mode)
-
-    # ---- gateway plane (server/gateway/): REST control + WSS passthrough in
-    # front of the sglang-omni pool; only when replicas are configured ----
-    gateway_registry = None
-    gateway_pool = None
-    if settings.sglang_omni_urls.strip():
-        from .gateway.pool import GatewayPool
-        from .gateway.session import GatewayRegistry
-        from .gateway.tokens import TokenIssuer
-
-        gateway_pool = GatewayPool(settings)
-        gateway_pool.start_prober()
-        gateway_registry = GatewayRegistry(
-            settings, gateway_pool, TokenIssuer(settings.gateway_ws_token_ttl_s))
-        app.state.gateway_pool = gateway_pool
-        app.state.gateway_registry = gateway_registry
-        app.state.gateway_tokens = gateway_registry.tokens
-        log.info("Gateway plane up: %d sglang-omni replica(s)", gateway_pool.capacity)
 
     # ---- GPU topology → placement plan (drives VLM/ASR/TTS process layout) ----
     topology = await asyncio.to_thread(probe_topology)
@@ -111,12 +93,6 @@ async def lifespan(app: FastAPI):
         yield
     finally:
         log.info("Shutting down backend.")
-        if gateway_registry is not None:
-            try:
-                await gateway_registry.aclose()
-            except Exception as exc:  # noqa: BLE001
-                log.warning("gateway registry shutdown failed: %s", exc)
-            gateway_pool.close()
         try:
             await runtime.session_manager.aclose()
         except Exception as exc:  # noqa: BLE001
@@ -160,14 +136,8 @@ def create_app() -> FastAPI:
     # durable history + CAS media store (server/persistence/)
     app.include_router(history.router)
     app.include_router(media.router)
-    # gateway plane (server/gateway/): REST control + WSS passthrough for
-    # external clients speaking the sglang-omni data-plane protocol verbatim;
-    # only mounted when replicas are configured (GATEWAY_PLAN.md §2-P1)
-    if settings.sglang_omni_urls.strip():
-        from .gateway import rest as gateway_rest
-        from .gateway import ws as gateway_ws
-        app.include_router(gateway_rest.router)
-        app.include_router(gateway_ws.router)
+    # OpenAI-compatible surface (v1/chat/completions) over the Realtime VLM
+    app.include_router(openai.router)
     return app
 
 
