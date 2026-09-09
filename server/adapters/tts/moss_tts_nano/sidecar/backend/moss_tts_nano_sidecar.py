@@ -211,14 +211,24 @@ def _pcm16le(audio_array: Any) -> bytes:
     if array.size == 0:
         return b""
     array = np.nan_to_num(array, nan=0.0, posinf=1.0, neginf=-1.0)
-    array = np.clip(array, -1.0, 1.0)
-    # Prevent hard-clip distortion: the model intermittently emits peaks > 1.0.
-    # Scaling those samples to full scale flat-tops them, which is the audible
-    # "noise burst" mid-speech. Normalize the chunk's peak to 0.92 so the
-    # loudest sample stays below full scale (keeps dynamics, no distortion).
-    peak = float(np.max(np.abs(array))) if array.size else 0.0
-    if peak > 0.92:
-        array = array * (0.92 / peak)
+    # Soft-limit instead of hard-clipping: the model/tokenizer intermittently
+    # emits isolated sample spikes above ±1.0 (decoder glitches up to ~0.5 ms).
+    # Hard-clipping flat-tops those spikes into audible square-wave bursts, and
+    # whole-chunk peak normalization was the wrong fix — one spike dragged the
+    # volume of the entire 4 s chunk down. A tanh soft limiter only touches
+    # samples near the ceiling: below kLIM the transfer is linear (dynamics
+    # untouched), above it the slope smoothly compresses toward ±1.0, so a
+    # single-sample spike becomes a rounded nudge instead of a square wave.
+    kLIM = 0.92
+    kCEIL = 0.985  # tanh asymptote target: peaks round off below int16 full-scale
+    over = np.abs(array) > kLIM
+    if over.any():
+        # tanh mapping that is identity at kLIM and asymptotic to ±kCEIL:
+        #   sign(x) * (kCEIL - (kCEIL-kLIM) * exp(-( |x|-kLIM )/(kCEIL-kLIM)))
+        # (closed-form exponential ease-out; no asymptote-riding samples)
+        a = np.abs(array[over])
+        soft = kCEIL - (kCEIL - kLIM) * np.exp(-(a - kLIM) / (kCEIL - kLIM))
+        array[over] = np.sign(array[over]) * soft
     pcm = (array * 32767.0).astype("<i2", copy=False)
     return pcm.tobytes(order="C")
 
