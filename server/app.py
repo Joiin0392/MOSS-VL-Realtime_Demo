@@ -42,21 +42,9 @@ async def lifespan(app: FastAPI):
 
     # ---- gateway plane (server/gateway/): REST control + WSS passthrough in
     # front of the sglang-omni pool; only when replicas are configured ----
+    # (sglang-omni remote backend not part of this branch; VLM_DEPLOY=inproc)
     gateway_registry = None
     gateway_pool = None
-    if settings.sglang_omni_urls.strip():
-        from .gateway.pool import GatewayPool
-        from .gateway.session import GatewayRegistry
-        from .gateway.tokens import TokenIssuer
-
-        gateway_pool = GatewayPool(settings)
-        gateway_pool.start_prober()
-        gateway_registry = GatewayRegistry(
-            settings, gateway_pool, TokenIssuer(settings.gateway_ws_token_ttl_s))
-        app.state.gateway_pool = gateway_pool
-        app.state.gateway_registry = gateway_registry
-        app.state.gateway_tokens = gateway_registry.tokens
-        log.info("Gateway plane up: %d sglang-omni replica(s)", gateway_pool.capacity)
 
     # ---- GPU topology → placement plan (drives VLM/ASR/TTS process layout) ----
     topology = await asyncio.to_thread(probe_topology)
@@ -160,14 +148,6 @@ def create_app() -> FastAPI:
     # durable history + CAS media store (server/persistence/)
     app.include_router(history.router)
     app.include_router(media.router)
-    # gateway plane (server/gateway/): REST control + WSS passthrough for
-    # external clients speaking the sglang-omni data-plane protocol verbatim;
-    # only mounted when replicas are configured (GATEWAY_PLAN.md §2-P1)
-    if settings.sglang_omni_urls.strip():
-        from .gateway import rest as gateway_rest
-        from .gateway import ws as gateway_ws
-        app.include_router(gateway_rest.router)
-        app.include_router(gateway_ws.router)
     return app
 
 
