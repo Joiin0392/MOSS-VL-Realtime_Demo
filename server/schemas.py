@@ -17,7 +17,13 @@ class LoadModelRequest(BaseModel):
 
 
 class GenerationParams(BaseModel):
-    temperature: float = 0.7
+    # None → server default, resolved per plane: realtime HF → Settings.temperature
+    # (GEN_TEMPERATURE); offline sglang → Settings.vlm_offline_temperature
+    # (VLM_OFFLINE_TEMPERATURE). The schema must NOT hardcode a numeric default:
+    # the sglang offline plane degenerates into sentence/single-char loops on
+    # long generations at 0.7 (measured: temp 0.3 loops=0 vs 0.7 loops=94+), so
+    # NPU deployments need to tune it via env. Explicit request values still win.
+    temperature: Optional[float] = None
     top_k: int = 20
     top_p: float = 0.8
     # Board parity (realtime): SAMPLE, not greedy. Greedy on the silence-trained

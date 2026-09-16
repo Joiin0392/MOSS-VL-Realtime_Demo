@@ -795,6 +795,11 @@ class HfMossVlAdapter:
         processor = self.processor
         tokenizer = getattr(processor, "tokenizer", processor)
         params = req.params
+        # Schema temperature is None-able (→ server default). The offline decode
+        # loop samples via params.temperature directly (`or 1.0` would degrade to
+        # temp 1.0) — resolve to Settings here, same contract as realtime.
+        if getattr(params, "temperature", None) is None:
+            params.temperature = self.s.temperature
 
         # media resolution is blocking (PIL + disk for CAS handles) — off-loop
         messages, images, videos = await asyncio.to_thread(self._prepare_chat_messages, req)

@@ -335,6 +335,11 @@ class Settings:
     # (do_sample=True, board parity). GEN_* feeds the offline-chat Settings
     # path; kept aligned for consistency.
     temperature: float = field(default_factory=lambda: _env_float("GEN_TEMPERATURE", 0.7))
+    # Offline-chat (sglang plane) sampling default — resolved when the request
+    # leaves GenerationParams.temperature unset. Kept separate from GEN_TEMPERATURE:
+    # the offline Instruct ckpt degenerates (sentence loops → single-char runs) at
+    # 0.7 on NPU; 0.3 measured clean. Unset → stock 0.7 (GPU/board parity).
+    vlm_offline_temperature: float = field(default_factory=lambda: _env_float("VLM_OFFLINE_TEMPERATURE", 0.7))
     top_k: int = field(default_factory=lambda: _env_int("GEN_TOP_K", 20))
     top_p: float = field(default_factory=lambda: _env_float("GEN_TOP_P", 0.8))
     do_sample: bool = field(default_factory=lambda: _env_flag("GEN_DO_SAMPLE", True))

@@ -26,8 +26,10 @@ os.environ.update({
 })
 
 import asyncio  # noqa: E402
+import base64  # noqa: E402
 import dataclasses  # noqa: E402
 import hashlib  # noqa: E402
+from io import BytesIO  # noqa: E402
 import json  # noqa: E402
 import sys  # noqa: E402
 from typing import Any, Dict, List, Optional  # noqa: E402
@@ -37,7 +39,7 @@ from fastapi import FastAPI, Request  # noqa: E402
 from fastapi.responses import StreamingResponse  # noqa: E402
 
 from server.adapters.vlm.moss_vl_sglang.adapter import (  # noqa: E402
-    SglangOfflinePool, _prepare_sglang_chat, _sampling_params)
+    SglangOfflinePool, _prepare_sglang_chat, _resolve_image_payload, _sampling_params)
 from server.config import Settings  # noqa: E402
 from server.gpu.placement import OfflineSpec, PlacementPlan  # noqa: E402
 from server.schemas import ChatRequest, GenerationParams  # noqa: E402
@@ -157,8 +159,67 @@ async def test_stream_and_params() -> None:
     print("stream + sampling params: OK")
 
 
+def image_bytes(fmt: str = "JPEG") -> bytes:
+    from PIL import Image
+
+    buf = BytesIO()
+    Image.new("RGB", (16, 16), (180, 60, 30)).save(buf, format=fmt)
+    return buf.getvalue()
+
+
+def test_image_payloads() -> None:
+    for fmt, mime in [("JPEG", "image/jpeg"), ("PNG", "image/png"),
+                      ("WEBP", "image/webp"), ("GIF", "image/gif")]:
+        data = image_bytes(fmt)
+        encoded = base64.b64encode(data).decode("ascii")
+        if fmt == "JPEG":
+            assert encoded.startswith("/9j/")  # previously mistaken for a path
+        expected = f"data:{mime};base64,{encoded}"
+        for payload in (put_blob(data), encoded, expected):
+            actual = _resolve_image_payload(payload)
+            assert actual == expected
+            assert base64.b64decode(actual.split(",", 1)[1], validate=True) == data
+    print("image data URLs (CAS + raw base64 + existing URLs): OK")
+
+
+async def test_multiturn_media_wire() -> None:
+    jpeg = image_bytes()
+    png = image_bytes("PNG")
+    jpeg_url = "data:image/jpeg;base64," + base64.b64encode(jpeg).decode("ascii")
+    png_url = "data:image/png;base64," + base64.b64encode(png).decode("ascii")
+    video = put_blob(b"fake-mp4-bytes")
+    messages = [
+        {"role": "user", "content": [
+            {"type": "image", "media": put_blob(jpeg)},
+            {"type": "video", "media": video},
+            {"type": "text", "text": "previous media"}]},
+        {"role": "assistant", "content": "previous reply"},
+        {"role": "user", "content": [
+            {"type": "image", "image": base64.b64encode(png).decode("ascii")},
+            {"type": "image", "image": jpeg_url},
+            {"type": "text", "text": "compare with previous media"}]},
+    ]
+    req = ChatRequest(messages=messages)
+    before = req.model_dump()
+    assert [d async for d in make_pool([PORT]).generate_stream(req)] == expected_deltas()
+    body = captured["body"]
+    # history media is STRIPPED (OOM bound, commit "strip history media"):
+    # only the LAST user turn keeps real media — older turns degrade to
+    # "[图片]"/"[视频]" text markers so the model knows what was discussed.
+    assert body["image_data"] == [png_url, jpeg_url]
+    assert body.get("video_data") is None  # all video stripped with its turn
+    assert body["text"].count("<|image|>") == 2
+    assert body["text"].count("<|video|>") == 0
+    assert body["text"].count("[图片]") == 1
+    assert body["text"].count("[视频]") == 1
+    assert "previous reply" in body["text"] and "compare with previous media" in body["text"]
+    assert req.model_dump() == before
+    print("multi-turn media preserved in actual HTTP payload: OK")
+
+
 async def test_media_prep() -> None:
-    img = put_blob(b"fake-jpeg-bytes")
+    jpeg = image_bytes()
+    img = put_blob(jpeg)
     vid = put_blob(b"fake-mp4-bytes")
     req = ChatRequest(
         messages=[{"role": "user", "content": [
@@ -172,10 +233,8 @@ async def test_media_prep() -> None:
     assert content == "<|image|><|image|><|video|>这是什么？", content
     assert len(image_data) == 2
     assert image_data[0] == "data:image/png;base64,AAAA"  # data-URL passes through
-    # image CAS handle → blob bytes wrapped in data: URL (sglang's
-    # get_image_bytes treats strings starting with "/" as file paths)
-    import base64 as _b64
-    assert image_data[1] == "data:image;base64," + _b64.b64encode(b"fake-jpeg-bytes").decode("ascii")
+    # Images use explicit data URLs; videos keep their existing blob paths.
+    assert image_data[1] == "data:image/jpeg;base64," + base64.b64encode(jpeg).decode("ascii")
     assert len(video_data) == 1 and os.path.exists(video_data[0])
 
     # user-typed placeholder suppresses ONE auto-insertion (board skip logic)
@@ -252,13 +311,17 @@ async def test_chat_routing() -> None:
 def test_sampling_unit() -> None:
     sp = _sampling_params(GenerationParams(
         temperature=0.9, do_sample=True, top_k=5, top_p=0.5,
-        repetition_penalty=1.1, max_new_tokens=64))
+        repetition_penalty=1.1, max_new_tokens=64), temperature_default=0.3)
     assert sp == {"max_new_tokens": 64, "temperature": 0.9, "top_p": 0.5,
                   "top_k": 5, "repetition_penalty": 1.1,
                   "stop": ["<|im_end|>"], "skip_special_tokens": True}
     # schema default is now repetition_penalty=None (realtime falls back to
     # GEN_REPETITION_PENALTY) — the sglang mapper must stay None-safe
-    assert _sampling_params(GenerationParams())["repetition_penalty"] == 1.0
+    assert _sampling_params(GenerationParams(), temperature_default=0.3)["repetition_penalty"] == 1.0
+    # temperature=None → server default (VLM_OFFLINE_TEMPERATURE); explicit wins
+    assert _sampling_params(GenerationParams(), temperature_default=0.3)["temperature"] == 0.3
+    assert _sampling_params(GenerationParams(temperature=0.9), temperature_default=0.3)["temperature"] == 0.9
+    assert _sampling_params(GenerationParams(do_sample=False), temperature_default=0.3)["temperature"] == 0.0
     print("sampling unit: OK")
 
 
@@ -267,6 +330,8 @@ async def amain() -> int:
     try:
         await test_stream_and_params()
         await test_media_prep()
+        test_image_payloads()
+        await test_multiturn_media_wire()
         await test_failover_and_down()
         await test_chat_routing()
         test_sampling_unit()

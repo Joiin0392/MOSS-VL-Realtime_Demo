@@ -165,7 +165,7 @@ class SglangOfflinePool:
             tokenize=False, add_generation_prompt=True)
         body: Dict[str, Any] = {
             "text": prompt,
-            "sampling_params": _sampling_params(req.params),
+            "sampling_params": _sampling_params(req.params, self.s.vlm_offline_temperature),
             "stream": True,
         }
         if image_data:
@@ -271,12 +271,17 @@ async def _iter_sse_deltas(resp: aiohttp.ClientResponse) -> AsyncIterator[str]:
                     yield delta
 
 
-def _sampling_params(p: Any) -> Dict[str, Any]:
-    """Board `_build_sglang_sampling_params` parity."""
-    do_sample = bool(getattr(p, "do_sample", False))
+def _sampling_params(p: Any, temperature_default: float) -> Dict[str, Any]:
+    """Board `_build_sglang_sampling_params` parity, plus server defaults:
+    GenerationParams fields are None-able (schema) — resolve temperature from
+    Settings.vlm_offline_temperature (NPU tuning knob; see config.py)."""
+    do_sample = bool(getattr(p, "do_sample", True))
+    temperature = getattr(p, "temperature", None)
+    if temperature is None:
+        temperature = temperature_default
     return {
         "max_new_tokens": int(getattr(p, "max_new_tokens", 4096)),
-        "temperature": float(getattr(p, "temperature", 0.0)) if do_sample else 0.0,
+        "temperature": float(temperature) if do_sample else 0.0,
         "top_p": float(getattr(p, "top_p", 0.8)),
         "top_k": int(getattr(p, "top_k", 20)),
         # `or 1.0`: the schema default is None (→ server default lives in the
