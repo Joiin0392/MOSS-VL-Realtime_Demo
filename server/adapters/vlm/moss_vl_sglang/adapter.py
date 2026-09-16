@@ -165,7 +165,11 @@ class SglangOfflinePool:
             tokenize=False, add_generation_prompt=True)
         body: Dict[str, Any] = {
             "text": prompt,
-            "sampling_params": _sampling_params(req.params, self.s.vlm_offline_temperature),
+            "sampling_params": _sampling_params(
+                req.params,
+                self.s.vlm_offline_temperature,
+                self.s.vlm_offline_frequency_penalty,
+                self.s.vlm_offline_presence_penalty),
             "stream": True,
         }
         if image_data:
@@ -271,14 +275,23 @@ async def _iter_sse_deltas(resp: aiohttp.ClientResponse) -> AsyncIterator[str]:
                     yield delta
 
 
-def _sampling_params(p: Any, temperature_default: float) -> Dict[str, Any]:
+def _sampling_params(p: Any, temperature_default: float,
+                     frequency_penalty_default: float = 0.0,
+                     presence_penalty_default: float = 0.0) -> Dict[str, Any]:
     """Board `_build_sglang_sampling_params` parity, plus server defaults:
     GenerationParams fields are None-able (schema) — resolve temperature from
-    Settings.vlm_offline_temperature (NPU tuning knob; see config.py)."""
+    Settings.vlm_offline_temperature and the additive penalties from
+    Settings.vlm_offline_*_penalty (NPU loop mitigation; see config.py)."""
     do_sample = bool(getattr(p, "do_sample", True))
     temperature = getattr(p, "temperature", None)
     if temperature is None:
         temperature = temperature_default
+    frequency_penalty = getattr(p, "frequency_penalty", None)
+    if frequency_penalty is None:
+        frequency_penalty = frequency_penalty_default
+    presence_penalty = getattr(p, "presence_penalty", None)
+    if presence_penalty is None:
+        presence_penalty = presence_penalty_default
     return {
         "max_new_tokens": int(getattr(p, "max_new_tokens", 4096)),
         "temperature": float(temperature) if do_sample else 0.0,
@@ -288,6 +301,8 @@ def _sampling_params(p: Any, temperature_default: float) -> Dict[str, Any]:
         # REALTIME adapter; offline keeps stock 1.0) and getattr's fallback
         # only fires when the attribute is ABSENT, not when it is None
         "repetition_penalty": float(getattr(p, "repetition_penalty", None) or 1.0),
+        "frequency_penalty": float(frequency_penalty),
+        "presence_penalty": float(presence_penalty),
         "stop": ["<|im_end|>"],
         "skip_special_tokens": True,
     }

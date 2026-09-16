@@ -311,15 +311,21 @@ async def test_chat_routing() -> None:
 def test_sampling_unit() -> None:
     sp = _sampling_params(GenerationParams(
         temperature=0.9, do_sample=True, top_k=5, top_p=0.5,
-        repetition_penalty=1.1, max_new_tokens=64), temperature_default=0.3)
+        repetition_penalty=1.1, max_new_tokens=64,
+        frequency_penalty=0.2, presence_penalty=0.4), temperature_default=0.3)
     assert sp == {"max_new_tokens": 64, "temperature": 0.9, "top_p": 0.5,
                   "top_k": 5, "repetition_penalty": 1.1,
+                  "frequency_penalty": 0.2, "presence_penalty": 0.4,
                   "stop": ["<|im_end|>"], "skip_special_tokens": True}
     # schema default is now repetition_penalty=None (realtime falls back to
     # GEN_REPETITION_PENALTY) — the sglang mapper must stay None-safe
-    assert _sampling_params(GenerationParams(), temperature_default=0.3)["repetition_penalty"] == 1.0
+    sp0 = _sampling_params(GenerationParams(), temperature_default=0.3,
+                           frequency_penalty_default=0.3)
+    assert sp0["repetition_penalty"] == 1.0
     # temperature=None → server default (VLM_OFFLINE_TEMPERATURE); explicit wins
-    assert _sampling_params(GenerationParams(), temperature_default=0.3)["temperature"] == 0.3
+    assert sp0["temperature"] == 0.3
+    # additive penalties None → server default (VLM_OFFLINE_*_PENALTY)
+    assert sp0["frequency_penalty"] == 0.3 and sp0["presence_penalty"] == 0.0
     assert _sampling_params(GenerationParams(temperature=0.9), temperature_default=0.3)["temperature"] == 0.9
     assert _sampling_params(GenerationParams(do_sample=False), temperature_default=0.3)["temperature"] == 0.0
     print("sampling unit: OK")

@@ -36,6 +36,12 @@ class GenerationParams(BaseModel):
     # via the HF adapter's fallback (moss_vl_hf/adapter.py start_realtime_session).
     # The frontend never sends this; an explicit request value still wins.
     repetition_penalty: Optional[float] = None
+    # Additive penalties — the WORKING loop remedy for the offline sglang plane
+    # (multiplicative repetition_penalty is counterproductive on CJK: it distorts
+    # common-char logits and induces worse loops; measured 1.05/1.1/1.15 all loop).
+    # None → Settings.vlm_offline_frequency_penalty / _presence_penalty.
+    frequency_penalty: Optional[float] = None
+    presence_penalty: Optional[float] = None
     max_new_tokens: int = 4096
     min_pixels: Optional[int] = None
     max_pixels: Optional[int] = None

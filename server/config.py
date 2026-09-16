@@ -340,6 +340,15 @@ class Settings:
     # the offline Instruct ckpt degenerates (sentence loops → single-char runs) at
     # 0.7 on NPU; 0.3 measured clean. Unset → stock 0.7 (GPU/board parity).
     vlm_offline_temperature: float = field(default_factory=lambda: _env_float("VLM_OFFLINE_TEMPERATURE", 0.7))
+    # Offline-chat loop remedy (additive penalties; see schemas.GenerationParams).
+    # Unset → stock 0.0 (GPU/board parity); NPU deploy sets 1.0 in .env.deploy
+    # (measured: 1.0 clean 3/3 at 4096 tokens + short answers unaffected;
+    # 0.6 still degenerated 1/3; 0.3 too weak). NOTE: do NOT use
+    # repetition_penalty for this — it measurably worsens CJK loops — and do
+    # NOT expose min_p on the ascend sampler (crashed replicas before the
+    # sampler.py namedtuple fix; kept unexposed as redundant with freq).
+    vlm_offline_frequency_penalty: float = field(default_factory=lambda: _env_float("VLM_OFFLINE_FREQUENCY_PENALTY", 0.0))
+    vlm_offline_presence_penalty: float = field(default_factory=lambda: _env_float("VLM_OFFLINE_PRESENCE_PENALTY", 0.0))
     top_k: int = field(default_factory=lambda: _env_int("GEN_TOP_K", 20))
     top_p: float = field(default_factory=lambda: _env_float("GEN_TOP_P", 0.8))
     do_sample: bool = field(default_factory=lambda: _env_flag("GEN_DO_SAMPLE", True))
