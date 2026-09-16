@@ -1,0 +1,59 @@
+# ⚠️ 历史遗留：2026-08-30 单卡验证时期的部署快照（信息已过时，当前栈见 Moss-VL-it2）
+
+MOSS-VL Realtime Demo — 模型部署清单
+
+一、模型部署情况
+
+1. VLM（视觉语言模型）
+   - 模型: MOSS-VL-Realtime-0708（~22GB，bf16）
+   - 模型路径: /inspire/sj-ssd/project/pretrain-test/public/models/MOSS-VL-Realtime-0708
+   - 运行设备: NPU 卡 0（ASCEND_RT_VISIBLE_DEVICES=0）
+   - HBM 占用: 62214 / 65536 MB（约 60GB）
+   - Attention: eager
+   - 进程: uvicorn server.app:app（PID 2699666）
+   - 服务地址: http://127.0.0.1:8000
+
+2. ASR（语音识别）
+   - 模型: SenseVoiceSmall + fsmn-vad
+   - 模型路径: /inspire/sj-ssd/project/pretrain-test/public/models/SenseVoiceSmall
+   - 运行设备: CPU（ASR_DEVICE=cpu, ASR_FP16=false）
+   - 集成在 API 后端进程内，无独立端口
+
+3. TTS（语音合成）
+   - 模型: MOSS-TTS-Nano-100M
+   - 模型路径: /inspire/sj-ssd/project/pretrain-test/public/models/MOSS-TTS-Nano-100M
+   - 运行设备: CPU（MOSS_TTS_NANO_DEVICE=cpu）
+   - 4 个 sidecar 进程（负载均衡）:
+     :18100 (PID 2700527)
+     :18101 (PID 2700531)
+     :18102 (PID 2700525)
+     :18103 (PID 2700526)
+
+二、NPU 卡使用情况
+
+只有 NPU 卡 0 被使用（VLM 模型），其余 15 张卡空闲。
+NPU 0: HBM 62214/65536 MB（VLM 占用）
+NPU 1-15: HBM ~3420/65536 MB（空闲，仅驱动开销）
+
+三、服务地址
+
+- API 后端: http://127.0.0.1:8000
+  健康检查: http://127.0.0.1:8000/api/health
+  状态查询: http://127.0.0.1:8000/api/status
+
+- Web 前端: http://127.0.0.1:5173
+  （通过 vite preview 的 /api 代理转发到后端 :8000）
+
+- 容器外浏览器访问:
+  https://notebook-inspire-sj.sii.edu.cn/ws-d225f6ce-18f2-4517-81d6-64bec68797da/project-2d99259a-229e-4ff3-a518-33c806c812a3/user-b844d018-f6ed-4504-aa63-2350a154078b/vscode/605154f2-917c-4ade-a701-cdcc4e670b10/50057463-56f3-470a-b84b-8d9a470f67ea/proxy/5173/
+
+四、部署配置文件
+
+.env.deploy 位于 MOSS-VL-Realtime_Demo/ 目录下，包含所有环境变量配置。
+关键配置:
+  ASCEND_RT_VISIBLE_DEVICES=0  （指定 NPU 卡 0）
+  VLM_DEPLOY=inproc             （单进程模式，VLM 加载在网关内）
+  ATTN_IMPL=eager               （NPU 不支持 flash_attn，SDPA 会挂起）
+  OFFLINE_PROVIDER=none         （禁用 sglang 离线路径）
+  ASR_DEVICE=cpu                （ASR 跑 CPU）
+  MOSS_TTS_NANO_DEVICE=cpu      （TTS 跑 CPU）

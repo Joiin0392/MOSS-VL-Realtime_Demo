@@ -344,6 +344,9 @@ class SglangSidecarSupervisor:
 
     def _env(self, spec: OfflineSpec) -> Dict[str, str]:
         env = _with_ffmpeg_libs(dict(os.environ), self.s)
+        # Decode self-attention via torch sdpa math path (bypass the CANN
+        # fused _npu_paged_attention kernel whose long generations degenerate
+        # into token loops; HF-eager reference is clean on the same inputs).
         set_visible_device(env, spec.gpu_index)
         env["HF_HUB_OFFLINE"] = "1"
         env["TRANSFORMERS_OFFLINE"] = "1"

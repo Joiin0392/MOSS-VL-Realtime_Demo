@@ -1,0 +1,6 @@
+MOSS-VL Realtime Demo 访问地址（2026-09-06 更新）
+
+https://notebook-inspire-sj.sii.edu.cn/ws-cdf848f2-b9ea-4692-b3ae-116129e5029e/project-2d99259a-229e-4ff3-a518-33c806c812a3/user-b844d018-f6ed-4504-aa63-2350a154078b/vscode/f5ded19f-d195-46b8-941d-3f129aa0fbe3/ddc39d6e-abfe-4458-8dca-9da0f7b573b6/proxy/20941/
+
+404 原因: VSCode 会话 ID 变化。地址失效时在容器内执行
+env | grep VSCODE_PROXY_URI 并把 {{port}} 换成 20941。

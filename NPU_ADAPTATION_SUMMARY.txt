@@ -1,0 +1,139 @@
+MOSS-VL Realtime Demo NPU 适配 — 问题总结
+
+一、设备抽象层缺失
+
+问题：Demo 代码中大量硬编码 CUDA 设备字符串和 nvidia-smi 检测，NPU 上无法运行。
+
+原因：Demo 原始代码仅支持 NVIDIA GPU，所有设备引用为 cuda:N，GPU 检测用 nvidia-smi，进程隔离用 CUDA_VISIBLE_DEVICES。
+
+修复：
+- 新建 server/device_compat.py 统一设备抽象层（设备类型检测、设备字符串、内存监控、attention 选择、设备可见性环境变量）
+- server/gpu/topology.py 添加 npu-smi 拓扑探测和 NPU torch child probe
+- server/gpu/placement.py 设备字符串从 cuda: 改为 device_compat.device_str()
+- server/gpu/supervisor.py CUDA_VISIBLE_DEVICES 改为 ASCEND_RT_VISIBLE_DEVICES
+- server/adapters/vlm/moss_vl_hf/adapter.py 设备字符串和 attention 选择走 device_compat
+- server/vlm_worker/app.py torch.cuda.* 替换为 device_compat.*
+- server/session/orchestrator.py、server/sidecars.py、ASR adapter 同步适配
+- scripts/deploy/demo.sh 添加 npu-smi 检测分支
+
+二、transformers 5.12.1 API 兼容性（共 7 处）
+
+1. OutputRecorder 导入路径变更
+   问题：from transformers.utils.generic import OutputRecorder 报 ImportError
+   原因：transformers 5.x 将 OutputRecorder 移到了 transformers.utils.output_capturing
+   修复：modeling_moss_vl.py 中添加 try/except 回退导入
+
+2. RoPE rope_type "default" 不再支持
+   问题：ROPE_INIT_FUNCTIONS["default"] 报 KeyError
+   原因：transformers 5.x 移除了 "default" rope type
+   修复：modeling_moss_vl.py 中手动计算 inv_freq（base ** (arange/head_dim)）
+
+3. create_causal_mask 参数变更
+   问题：input_embeds 参数名变为 inputs_embeds，cache_position 参数被移除
+   原因：transformers 5.x 重命名了参数
+   修复：modeling_moss_vl.py 中修正参数名和移除 cache_position
+
+4. _get_initial_cache_position 被移除
+   问题：self._get_initial_cache_position() 报 AttributeError
+   原因：transformers 5.x 内联了 cache_position 初始化逻辑
+   修复：modeling_moss_vl.py 中用 hasattr 检查，回退为 torch.arange
+
+5. apply_chat_template 返回类型变更
+   问题：torch.ones_like(initial_input_ids) 报 TypeError（收到 BatchEncoding 而非 Tensor）
+   原因：transformers 5.x 的 apply_chat_template 返回 BatchEncoding
+   修复：mossvl_patches.py 中用 hasattr(input_ids, "input_ids") 提取 Tensor
+
+6. MossVLTextConfig 缺少 pad_token_id
+   问题：config.pad_token_id 报 AttributeError
+   原因：transformers 5.x 的 PreTrainedConfig 在 __getattribute__ 中强制检查
+   修复：configuration_moss_vl.py 中添加 pad_token_id 参数
+
+7. _keys_to_ignore_on_load_unexpected 类型错误（TTS 模型）
+   问题：TypeError: unsupported operand type(s) for |: 'list' and 'set'
+   原因：MOSS-TTS-Nano 用 list 定义 _keys_to_ignore_on_load_unexpected，transformers 5.x 用 | 合并它和 set
+   修复：modeling_moss_tts_nano.py 中将 list 改为 set
+
+三、RoPE inv_freq buffer 被 from_pretrained 覆盖（3 个模型，共 28+ 层）
+
+这是最核心的问题，影响了 VLM 文本推理、VLM 视觉编码器和 TTS 语音合成。
+
+问题：模型加载后 inv_freq buffer 值为 0、极小数（如 9.9986e-05）或 NaN，导致 cos/sin 全 NaN，logits 全 NaN，输出固定为 "!"。
+
+原因：PyTorch 的 register_buffer(persistent=False) 在 from_pretrained 加载权重时仍会被 state dict 覆盖。HF 的权重加载机制用随机/零值填充了非 persistent buffer，覆盖了 __init__ 中正确计算的 inv_freq。
+
+影响范围：
+- VLM 文本 RoPE（MossVLTextRotaryEmbedding）：1 个 inv_freq，64 维
+- VLM 视觉 RoPE（MossVLVisionRotaryEmbedding）：1 个 inv_freq，18 维
+- TTS 主 transformer RoPE（MossTTSNanoGPT2RotaryEmbedding）：12 层各 1 个，64 维
+- TTS local transformer RoPE：1 个，64 维
+- 共计 15 个 inv_freq buffer 被覆盖
+
+修复方案（三层）：
+1. VLM 文本 RoPE：adapter.py 的 _fix_rope_inv_freq() 在 model.to(device) 后检查 inv_freq[0] 是否 ≈1.0，不满足则重新计算
+2. VLM 视觉 RoPE：同方法检查 inv_freq[0]，modeling_moss_vl.py 的 forward 中也有自修复
+3. TTS RoPE：moss_tts_nano_runtime.py 的 _load_model_locked() 中加载后立即遍历所有层修复 inv_freq；gpt2_decoder.py 的 forward 中也有自修复作为兜底
+
+检查条件：torch.isnan(inv_freq).any() or abs(inv_freq[0].item() - 1.0) > 0.01
+（正常 inv_freq[0] = 1.0 / (10000 ** 0) = 1.0，损坏值为 0 或极小数）
+
+四、VLM 模型加载类不一致导致 logits 差异
+
+问题：Demo 后端图片描述错误（描述成"自然景观"），但独立脚本用相同代码路径得到正确结果（"一辆黑色的科尼赛克跑车"）。
+
+原因：Demo 的 online_streaming 模式用 resolve_streaming_mossvl_classes() 通过 importlib.import_module 直接从源路径加载 MossVLForConditionalGeneration 类（模块名 MOSS-VL-Realtime-0708.modeling_moss_vl），而 AutoModelForCausalLM.from_pretrained(trust_remote_code=True) 通过 HF 缓存加载同一个类（模块名 transformers_modules.MOSS_hyphen_VL_...）。两个"同名"但"不同身份"的 Python 模块实例在 forward 中产生了不同的数值结果。
+
+诊断过程：
+- 冻结变量：同一张卡、同一模型代码、同一图片、同一 processor
+- 对比 prefill logits：Demo top1="这辆"(22.0) vs 独立脚本 top1="这是一辆"(21.75)
+- 排除了 inv_freq、rope_deltas、processor 输出、chat template 等所有变量
+- 最终发现 type(model).__module__ 不同
+
+修复：adapter.py 的 load() 方法中 online_streaming 模式改用 AutoModelForCausalLM.from_pretrained（与 offline 模式和独立脚本一致），不再用 resolve_streaming_mossvl_classes。
+
+五、图像处理器 NPU 兼容性
+
+问题：processing_moss_vl.py 和 video_processing_moss_vl.py 的 10D permute 操作在 NPU 上报错。
+
+原因：NPU 的算子只支持最大 8 维张量，permute(0,1,4,7,5,8,3,2,6,9) 是 10 维操作。
+
+修复：将 10D permute+reshape 移到 CPU 执行（patches.cpu() → permute → reshape → .to(original_device)），同时为 preprocessor_config.json 添加 interpolation=BICUBIC 字段，为 MossVLImagesKwargs 添加 interpolation 字段，为 MossVLImageProcessorFast 添加 __init__ 设置默认 interpolation。
+
+六、TTS 音频分词器模型缺失
+
+问题：TTS sidecar 报 "Repo id must be in the form 'repo_name'"。
+
+原因：MOSS-Audio-Tokenizer-Nano 模型未下载，Demo 的 models/tts/ 目录不存在。
+
+修复：从 HuggingFace 下载 MOSS-Audio-Tokenizer-Nano 到 models/tts/MOSS-Audio-Tokenizer-Nano/。
+
+七、TTS sidecar 启动超时
+
+问题：TTS sidecar 在 240 秒内未健康，被后端终止。
+
+原因：CPU 上 TTS 首次推理（warmup）很慢，默认 240 秒 health timeout 不够。
+
+修复：.env.deploy 中设置 TTS_HEALTH_TIMEOUT_S=600，MOSS_TTS_NANO_WARMUP_ON_LOAD=0（禁用 warmup，首次真实请求时再加载模型）。
+
+八、TTS attention 默认为 flash_attention_2
+
+问题：TTS 模型默认 attn_implementation=flash_attention_2，CPU 上不可用。
+
+原因：MOSS-TTS-Nano 的 config.json 中 attn_implementation 默认为 flash_attention_2。
+
+修复：.env.deploy 中设置 MOSS_TTS_NANO_ATTN=eager。
+
+九、TTS RoPE inv_freq 修复中的 meta tensor 问题
+
+问题：修复 inv_freq 时报 "Cannot copy out of meta tensor; no data!"。
+
+原因：from_pretrained 用 low_cpu_mem_usage 时先创建 meta tensor，_inv_freq_clean = inv_freq.clone() 保存的是 meta tensor 的 clone（无数据），后续 .to(device) 时报错。
+
+修复：不在 __init__ 中保存 clone，改为在 forward 中用 _compute_inv_freq() 动态重新计算（arange 在 CPU 上创建）。
+
+十、前端 AudioContext 采样率不匹配
+
+问题：TTS 音频播放时有 cicici 噪音。
+
+原因：浏览器 AudioContext 默认采样率 44100Hz，TTS 输出 48000Hz，浏览器重采样产生杂音。
+
+修复：pcmPlayer.ts 中创建 AudioContext 时指定 sampleRate: 48000 匹配 TTS 输出。
