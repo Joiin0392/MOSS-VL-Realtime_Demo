@@ -280,14 +280,15 @@ def _sampling_params(p: Any, temperature_default: float = 0.7,
                      presence_penalty_default: float = 0.0) -> Dict[str, Any]:
     """Board `_build_sglang_sampling_params` parity, plus server defaults.
 
-    The additive penalties are the operative server-side knobs: the request
-    schema carries no penalty fields at all, so every request resolves to the
-    Settings defaults (Settings.vlm_offline_*_penalty). They mitigate
-    accelerator (Ascend NPU) degeneration loops — bf16 kernel accumulation
-    bias compounds over autoregressive steps — without multiplicative
-    repetition_penalty's CJK backfires (0.0 = stock behavior). Penalties and
-    temperature are read via getattr with a None fallback because payload
-    shapes vary; an explicit request value always wins.
+    GenerationParams.temperature / frequency_penalty / presence_penalty are
+    None-able (schema) — unset fields resolve to the Settings defaults so the
+    offline plane owns server-side knobs: temperature via
+    Settings.vlm_offline_temperature, the additive penalties via
+    Settings.vlm_offline_*_penalty. The penalties mitigate accelerator (Ascend
+    NPU) degeneration loops — bf16 kernel accumulation bias compounds over
+    autoregressive steps — without multiplicative repetition_penalty's CJK
+    backfires (0.0 = stock behavior). An explicit request value always wins;
+    getattr None-fallbacks keep arbitrary payload shapes working.
     """
     do_sample = bool(getattr(p, "do_sample", True))
     temperature = getattr(p, "temperature", None)

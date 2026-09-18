@@ -337,14 +337,16 @@ def test_sampling_unit() -> None:
     # schema default is now repetition_penalty=None (realtime falls back to
     # GEN_REPETITION_PENALTY) — the sglang mapper must stay None-safe
     assert _sampling_params(GenerationParams())["repetition_penalty"] == 1.0
-    # the schema has NO penalty fields → requests always resolve to the
-    # Settings defaults; the schema's temperature (0.7) still wins over the
-    # server-side default
+    # None-able schema fields (temperature/penalties) resolve to the
+    # server-side defaults (Settings); explicit values still win
     sp = _sampling_params(GenerationParams(), temperature_default=0.55,
                           frequency_penalty_default=0.6,
                           presence_penalty_default=0.2)
-    assert sp["temperature"] == 0.7
+    assert sp["temperature"] == 0.55
     assert sp["frequency_penalty"] == 0.6 and sp["presence_penalty"] == 0.2
+    # explicit request penalties ride the schema fields and win over defaults
+    sp = _sampling_params(GenerationParams(frequency_penalty=0.3), 0.55, 0.6)
+    assert sp["frequency_penalty"] == 0.3 and sp["presence_penalty"] == 0.0
     # payload shapes without the attrs at all → server defaults fully apply
     sp = _sampling_params(types.SimpleNamespace(
         do_sample=True, top_p=0.8, top_k=20, max_new_tokens=64,
