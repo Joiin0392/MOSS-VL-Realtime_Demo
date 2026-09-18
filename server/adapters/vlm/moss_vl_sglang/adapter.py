@@ -159,13 +159,17 @@ class SglangOfflinePool:
     async def generate_stream(self, req: Any) -> AsyncIterator[str]:
         owner = await self._ensure_template_owner()
         messages, image_data, video_data = await asyncio.to_thread(
-            _prepare_sglang_chat, req)
+            _prepare_sglang_chat, req, self.s.vlm_offline_strip_history_media)
         prompt = await asyncio.to_thread(
             owner.apply_chat_template, messages,
             tokenize=False, add_generation_prompt=True)
         body: Dict[str, Any] = {
             "text": prompt,
-            "sampling_params": _sampling_params(req.params),
+            "sampling_params": _sampling_params(
+                req.params,
+                self.s.vlm_offline_temperature,
+                self.s.vlm_offline_frequency_penalty,
+                self.s.vlm_offline_presence_penalty),
             "stream": True,
         }
         if image_data:
@@ -271,18 +275,41 @@ async def _iter_sse_deltas(resp: aiohttp.ClientResponse) -> AsyncIterator[str]:
                     yield delta
 
 
-def _sampling_params(p: Any) -> Dict[str, Any]:
-    """Board `_build_sglang_sampling_params` parity."""
+def _sampling_params(p: Any, temperature_default: float = 0.7,
+                     frequency_penalty_default: float = 0.0,
+                     presence_penalty_default: float = 0.0) -> Dict[str, Any]:
+    """Board `_build_sglang_sampling_params` parity, plus server defaults.
+
+    The additive penalties are the operative server-side knobs: the request
+    schema carries no penalty fields at all, so every request resolves to the
+    Settings defaults (Settings.vlm_offline_*_penalty). They mitigate
+    accelerator (Ascend NPU) degeneration loops — bf16 kernel accumulation
+    bias compounds over autoregressive steps — without multiplicative
+    repetition_penalty's CJK backfires (0.0 = stock behavior). Penalties and
+    temperature are read via getattr with a None fallback because payload
+    shapes vary; an explicit request value always wins.
+    """
     do_sample = bool(getattr(p, "do_sample", True))
+    temperature = getattr(p, "temperature", None)
+    if temperature is None:
+        temperature = temperature_default
+    frequency_penalty = getattr(p, "frequency_penalty", None)
+    if frequency_penalty is None:
+        frequency_penalty = frequency_penalty_default
+    presence_penalty = getattr(p, "presence_penalty", None)
+    if presence_penalty is None:
+        presence_penalty = presence_penalty_default
     return {
         "max_new_tokens": int(getattr(p, "max_new_tokens", 4096)),
-        "temperature": float(getattr(p, "temperature", 0.7)) if do_sample else 0.0,
+        "temperature": float(temperature) if do_sample else 0.0,
         "top_p": float(getattr(p, "top_p", 0.8)),
         "top_k": int(getattr(p, "top_k", 20)),
         # `or 1.0`: the schema default is None (→ server default lives in the
         # REALTIME adapter; offline keeps stock 1.0) and getattr's fallback
         # only fires when the attribute is ABSENT, not when it is None
         "repetition_penalty": float(getattr(p, "repetition_penalty", None) or 1.0),
+        "frequency_penalty": float(frequency_penalty),
+        "presence_penalty": float(presence_penalty),
         "stop": ["<|im_end|>"],
         "skip_special_tokens": True,
     }
@@ -356,7 +383,8 @@ def _resolve_video_payload(payload: str) -> str:
     return path
 
 
-def _prepare_sglang_chat(req: Any) -> Tuple[List[Dict[str, Any]], List[str], List[str]]:
+def _prepare_sglang_chat(req: Any, strip_history_media: bool = False
+                         ) -> Tuple[List[Dict[str, Any]], List[str], List[str]]:
     """Normalize a ChatRequest → (flattened messages, image_data, video_data).
 
     Same wire-shape contract as vlm_hf._prepare_chat_messages (legacy top-level
@@ -366,6 +394,16 @@ def _prepare_sglang_chat(req: Any) -> Tuple[List[Dict[str, Any]], List[str], Lis
     tokens`, MOSS branch) and collects media payloads for sglang instead of
     PIL/tensors. Placeholders the user already typed into text parts are
     honored: that many auto-insertions are skipped (board parity).
+
+    With `strip_history_media` (Settings.vlm_offline_strip_history_media) only
+    the LAST user turn keeps its real media; every earlier turn's image/video
+    parts are replaced with `[图片]`/`[视频]` text markers. The frontend
+    resends the whole conversation on every request and each video expands to
+    ~20-80k vision tokens with ViT activations that grow linearly with the
+    media count — without this, long multi-turn chats eventually OOM the
+    accelerator (or exceed the KV pool). Earlier media is already reflected
+    in the assistant replies, so this bounds per-request memory without
+    changing the conversational semantics.
 
     Blocking (CAS path checks hit disk) — call via `asyncio.to_thread`.
     """
@@ -393,11 +431,24 @@ def _prepare_sglang_chat(req: Any) -> Tuple[List[Dict[str, Any]], List[str], Lis
 
     image_data: List[str] = []
     video_data: List[str] = []
-    for m in messages:
+
+    # Index of the newest user turn — the only one that keeps its real media
+    # when stripping is enabled (see docstring for the OOM rationale).
+    last_user_idx = None
+    if strip_history_media:
+        for i in range(len(messages) - 1, -1, -1):
+            if messages[i].get("role") == "user":
+                last_user_idx = i
+                break
+
+    for idx, m in enumerate(messages):
         content = m.get("content")
         if not isinstance(content, list):
             m["content"] = content if isinstance(content, str) else str(content or "")
             continue
+        # Only the latest user turn keeps real media; older turns are reduced
+        # to text markers so the model still knows what was discussed.
+        media_stripped = (last_user_idx is not None and idx != last_user_idx)
         # pass 1: placeholders already typed in text parts suppress that many
         # auto-insertions (board's existing-token skip logic, MOSS branch)
         existing_text = "".join(
@@ -414,6 +465,9 @@ def _prepare_sglang_chat(req: Any) -> Tuple[List[Dict[str, Any]], List[str], Lis
                 continue
             ptype = part.get("type")
             if ptype == "image":
+                if media_stripped:
+                    chunks.append("[图片]")
+                    continue
                 payload = part.get("media") or part.get("image") or part.get("data") or ""
                 image_data.append(_resolve_image_payload(str(payload)))
                 if img_skip > 0:
@@ -421,6 +475,9 @@ def _prepare_sglang_chat(req: Any) -> Tuple[List[Dict[str, Any]], List[str], Lis
                 else:
                     chunks.append(IMAGE_TOKEN)
             elif ptype == "video":
+                if media_stripped:
+                    chunks.append("[视频]")
+                    continue
                 payload = part.get("media") or part.get("video") or ""
                 video_data.append(_resolve_video_payload(str(payload)))
                 if vid_skip > 0:

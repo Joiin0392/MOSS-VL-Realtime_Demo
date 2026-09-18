@@ -340,6 +340,30 @@ class Settings:
     # offline GPUs are dedicated (no VLM worker / TTS / ASR colocation), so the
     # engine can take most of the card — board's 0.35 was for shared GPUs
     sglang_mem_fraction: float = field(default_factory=lambda: _env_float("SGLANG_MEM_FRACTION", 0.80))
+    # server-side sampling defaults for the offline sglang plane. The request
+    # schema's temperature is None-able — when the client omits it, these
+    # apply. The additive penalties mitigate accelerator (Ascend NPU)
+    # degeneration loops: bf16 kernel accumulation bias compounds over
+    # autoregressive steps and long image+text answers can fall into
+    # repetition attractors; small additive frequency/presence penalties
+    # suppress that without multiplicative repetition_penalty's CJK backfires
+    # (0.0 = stock behavior).
+    vlm_offline_temperature: float = field(
+        default_factory=lambda: _env_float("VLM_OFFLINE_TEMPERATURE", 0.7))
+    vlm_offline_frequency_penalty: float = field(
+        default_factory=lambda: _env_float("VLM_OFFLINE_FREQUENCY_PENALTY", 0.0))
+    vlm_offline_presence_penalty: float = field(
+        default_factory=lambda: _env_float("VLM_OFFLINE_PRESENCE_PENALTY", 0.0))
+    # Strip media from all but the LAST user turn before sending to sglang.
+    # The frontend resends the whole conversation on every request; each video
+    # expands to ~20-80k vision tokens and ViT activations grow with the
+    # media count, so long multi-turn chats eventually OOM the accelerator
+    # (or exceed the KV pool). Earlier media is already reflected in the
+    # assistant replies — replacing it with [图片]/[视频] text markers keeps
+    # the context semantics while bounding per-request memory. False restores
+    # the stock preserve-everything behavior.
+    vlm_offline_strip_history_media: bool = field(
+        default_factory=lambda: _env_flag("VLM_OFFLINE_STRIP_HISTORY_MEDIA", True))
     sglang_tp_size: int = field(default_factory=lambda: _env_int("SGLANG_TP_SIZE", 1))
     sglang_extra_args: str = field(default_factory=lambda: _env("SGLANG_EXTRA_ARGS", ""))
     # first boot pays weight load + flashinfer JIT/warmup (gated on /health_generate)
