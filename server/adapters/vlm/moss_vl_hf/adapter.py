@@ -648,7 +648,8 @@ class HfMossVlAdapter:
         return path
 
     @classmethod
-    def _prepare_chat_messages(cls, req: Any) -> Tuple[list, list, list]:
+    def _prepare_chat_messages(cls, req: Any, strip_history_media: bool = False
+                               ) -> Tuple[list, list, list]:
         """Normalize a ChatRequest into (template_messages, images, videos).
 
         Multi-turn: any message's `content` may be a parts list mixing
@@ -660,6 +661,18 @@ class HfMossVlAdapter:
         `<|image|>`/`<|video|>` placeholder order the chat template emits.
         Legacy top-level `req.images`/`req.videos` still attach to the LAST
         user message (prepended as parts) for backward compatibility.
+
+        With `strip_history_media` (Settings.vlm_offline_strip_history_media)
+        only the LAST user turn keeps its real media; every earlier turn's
+        image/video parts become `[图片]`/`[视频]` text markers BEFORE any
+        PIL decode / CAS resolution. The frontend resends the whole
+        conversation on every request, and each historical image would
+        otherwise be decoded and re-encoded by the vision tower every turn —
+        same per-request memory bound as the sglang plane (videos expand to
+        ~20-80k vision tokens each), which also keeps the two offline chat
+        backends behaviorally identical. Long videos OOM'ed even beefy GPUs
+        on multi-turn chats; earlier media is already reflected in the
+        assistant replies.
 
         Blocking (PIL + disk for handles) — call via `asyncio.to_thread`.
         """
@@ -680,12 +693,22 @@ class HfMossVlAdapter:
                 target["content"] = media_parts + [
                     {"type": "text", "text": body if isinstance(body, str) else str(body or "")}]
 
+        # Index of the newest user turn — the only one that keeps its real
+        # media when stripping is enabled (see docstring).
+        last_user_idx = None
+        if strip_history_media:
+            for i in range(len(messages) - 1, -1, -1):
+                if messages[i].get("role") == "user":
+                    last_user_idx = i
+                    break
+
         images: list = []
         videos: list = []
-        for m in messages:
+        for idx, m in enumerate(messages):
             content = m.get("content")
             if not isinstance(content, list):
                 continue
+            media_stripped = (last_user_idx is not None and idx != last_user_idx)
             parts = []
             for part in content:
                 if not isinstance(part, dict):
@@ -693,10 +716,16 @@ class HfMossVlAdapter:
                     continue
                 ptype = part.get("type")
                 if ptype == "image":
+                    if media_stripped:
+                        parts.append({"type": "text", "text": "[图片]"})
+                        continue
                     payload = part.get("media") or part.get("image") or part.get("data") or ""
                     images.append(cls._decode_chat_image(str(payload)))
                     parts.append({"type": "image"})
                 elif ptype == "video":
+                    if media_stripped:
+                        parts.append({"type": "text", "text": "[视频]"})
+                        continue
                     payload = part.get("media") or part.get("video") or ""
                     videos.append(cls._resolve_chat_video(str(payload)))
                     parts.append({"type": "video"})
@@ -739,7 +768,8 @@ class HfMossVlAdapter:
         params = req.params
 
         # media resolution is blocking (PIL + disk for CAS handles) — off-loop
-        messages, images, videos = await asyncio.to_thread(self._prepare_chat_messages, req)
+        messages, images, videos = await asyncio.to_thread(
+            self._prepare_chat_messages, req, self.s.vlm_offline_strip_history_media)
         vision: Optional[dict] = None
         if images or videos:
             template_owner = processor if hasattr(processor, "apply_chat_template") else tokenizer
