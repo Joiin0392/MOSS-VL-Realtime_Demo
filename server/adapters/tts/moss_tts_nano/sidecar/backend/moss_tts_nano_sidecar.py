@@ -550,11 +550,22 @@ async def generate_stream_audio(stream_id: str) -> Any:
         return JSONResponse(status_code=404, content={"error": "stream not found"})
 
     def iter_audio():
-        while True:
-            item = job.audio_queue.get()
-            if item is None:
-                break
-            yield item
+        try:
+            while True:
+                item = job.audio_queue.get()
+                if item is None:
+                    break
+                yield item
+        finally:
+            # Consumer gone (client disconnect or normal EOF): close the job so
+            # the producer's _put_audio retry loop exits on its next 0.1s tick
+            # and releases the runtime's global model lock. Without this, ONE
+            # stalled/disconnected consumer bricks the sidecar forever — the
+            # producer holds the lock while blocked on a full queue no one will
+            # ever drain (reproduced: open browser tab stall → all subsequent
+            # /generate-stream requests hang).
+            with job.lock:
+                job.is_closed = True
 
     return StreamingResponse(
         iter_audio(),
