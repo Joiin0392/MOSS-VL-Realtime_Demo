@@ -256,6 +256,7 @@ class StreamingJob:
                 "emitted_audio_seconds": self.emitted_audio_seconds,
                 "lead_seconds": self.lead_seconds,
                 "chunk_count": self.chunk_count,
+                "dropped_chunks": self.dropped_chunks,
                 "result": self.final_result,
             }
 
