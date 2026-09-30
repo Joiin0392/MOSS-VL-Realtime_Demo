@@ -14,6 +14,23 @@
 
 const SCHEDULE_LEAD_S = 0.001;
 
+// Network jitter buffer: over proxied/remote links WS chunks arrive late and
+// the back-to-back timeline underruns — the gap since the previous chunk ended
+// is heard as crackle/破音. A slack before the first chunk of a burst (and
+// after any underrun) rebuilds the buffer to absorb arrival jitter, at the
+// cost of +JB seconds of latency. 0 disables (pure-LAN behavior). Override:
+// URL ?jb=<seconds> or localStorage 'moss_jb' (clamped 0..2).
+const JITTER_BUFFER_S = (() => {
+  try {
+    const v = new URLSearchParams(location.search).get('jb') ?? localStorage.getItem('moss_jb');
+    const n = v ? parseFloat(v) : NaN;
+    if (Number.isFinite(n)) return Math.max(0, Math.min(2, n));
+  } catch {
+    /* non-browser context */
+  }
+  return 0.12;
+})();
+
 export class PcmPlayer {
   private ctx: AudioContext | null = null;
   private analyser: AnalyserNode | null = null;
@@ -73,7 +90,12 @@ export class PcmPlayer {
     const source = ctx.createBufferSource();
     source.buffer = buffer;
     source.connect(this.master!);
-    const startAt = Math.max(ctx.currentTime + SCHEDULE_LEAD_S, this.nextStartTime);
+    // Underrun detection: the timeline already passed the previous chunk's
+    // end (this chunk arrived after it finished) — scheduling at +0.001 would
+    // leave an audible discontinuity. Rebuild the buffer with JB slack; chunks
+    // arriving on time stay back-to-back with zero added latency.
+    const starved = this.nextStartTime <= ctx.currentTime + SCHEDULE_LEAD_S;
+    const startAt = Math.max(ctx.currentTime + SCHEDULE_LEAD_S + (starved ? JITTER_BUFFER_S : 0), this.nextStartTime);
     source.start(startAt);
     this.nextStartTime = startAt + buffer.duration;
 
