@@ -324,11 +324,26 @@ def test_prepare_chat_messages(data_dir: str) -> None:
 
         # document order: msg1's CAS image (320x200) first, then msg3's inline (64x48)
         assert [im.size for im in images] == [(320, 200), (64, 48)], [im.size for im in images]
-        # video handles resolve to blob PATHS (torchcodec decodes the file itself)
-        assert videos == [{"video_path": vblob}], videos
+        # video handles resolve to blob PATHS (torchcodec decodes the file
+        # itself). Plain strings, NOT {"video_path": ...} dicts: the
+        # processor's fetch_videos takes its "single video path" branch for
+        # strings, while dict entries require a "segments" key that chat
+        # uploads never have (KeyError).
+        assert videos == [str(vblob)], videos
         assert messages[0]["content"] == [{"type": "image"}, {"type": "text", "text": "turn one"}]
         assert messages[1]["content"] == "reply one"  # untouched string
         assert messages[2]["content"] == [
+            {"type": "image"}, {"type": "video"}, {"type": "text", "text": "turn two"}]
+
+        # strip_history_media=True: only the LAST user turn keeps its media
+        # (incl. legacy top-level attachments); earlier media becomes
+        # [图片]/[视频] text markers and its pixels are never decoded.
+        messages3, images3, videos3 = HfMossVlAdapter._prepare_chat_messages(req, True)
+        assert [im.size for im in images3] == [(64, 48)], [im.size for im in images3]
+        assert videos3 == [str(vblob)]
+        assert messages3[0]["content"] == [
+            {"type": "text", "text": "[图片]"}, {"type": "text", "text": "turn one"}]
+        assert messages3[2]["content"] == [
             {"type": "image"}, {"type": "video"}, {"type": "text", "text": "turn two"}]
 
         # legacy top-level videos attach to the LAST user message too
@@ -336,7 +351,7 @@ def test_prepare_chat_messages(data_dir: str) -> None:
             "messages": [{"role": "user", "content": "describe"}],
             "videos": [f"sha256:{vh}"]})
         messages_v, _, videos_v = HfMossVlAdapter._prepare_chat_messages(req_v)
-        assert videos_v == [{"video_path": vblob}]
+        assert videos_v == [str(vblob)]
         assert messages_v[0]["content"] == [
             {"type": "video"}, {"type": "text", "text": "describe"}]
 

@@ -243,8 +243,6 @@ class HfMossVlAdapter:
             "modes": list(self.caps.modes),
         }
 
-    # ---- realtime ----
-
     def _ensure_realtime_ready(self) -> None:
         if self.model is None:
             raise RuntimeError("No model loaded")
@@ -433,12 +431,13 @@ class HfMossVlAdapter:
         if session is None:
             raise KeyError(f"Realtime session not found: {session_id}")
         session.stop_event.set()
-        try:
-            stop_fn = getattr(self.model, "stop_real_time_generate", None)
-            if callable(stop_fn):
-                stop_fn()
-        except Exception:  # noqa: BLE001
-            pass
+        # stop_real_time_generate() may block on a device-sync call
+        # (torch.npu.empty_cache on a busy CANN device). Run it on a daemon
+        # thread so the join + force-release below always executes — the flag
+        # flip inside it makes the runner exit promptly regardless.
+        stop_fn = getattr(self.model, "stop_real_time_generate", None)
+        if callable(stop_fn):
+            threading.Thread(target=stop_fn, daemon=True).start()
         if session.thread is not None:
             session.thread.join(timeout=timeout_seconds)
             if session.thread.is_alive() and self._infer_lock_owner == session_id:
@@ -623,8 +622,8 @@ class HfMossVlAdapter:
         return Image.open(BytesIO(raw)).convert("RGB")
 
     @staticmethod
-    def _resolve_chat_video(payload: str) -> dict:
-        """One uploaded chat video → `{"video_path": …}` for the processor.
+    def _resolve_chat_video(payload: str) -> str:
+        """One uploaded chat video → path string for the processor.
 
         Videos are accepted ONLY as CAS handles (`sha256:<hex>` / bare 64-hex)
         minted by POST /api/media — never raw paths or inline base64, so a
@@ -632,6 +631,10 @@ class HfMossVlAdapter:
         pure path math (persistence.media.resolve_blob_path), so it works in
         VLM worker processes too; the video processor decodes the blob itself
         (torchcodec sniffs the container, the extension-less name is fine).
+
+        Returns a plain path string (not a dict) so the processor's
+        fetch_videos takes the "Single video path" branch, which decodes
+        the entire video without requiring a "segments" key.
         """
         from ....persistence.media import normalize_hash, resolve_blob_path
 
@@ -642,10 +645,11 @@ class HfMossVlAdapter:
         path = resolve_blob_path(s)
         if path is None:
             raise ValueError(f"unknown video media: {s[:19]}…")
-        return {"video_path": path}
+        return path
 
     @classmethod
-    def _prepare_chat_messages(cls, req: Any) -> Tuple[list, list, list]:
+    def _prepare_chat_messages(cls, req: Any, strip_history_media: bool = False
+                               ) -> Tuple[list, list, list]:
         """Normalize a ChatRequest into (template_messages, images, videos).
 
         Multi-turn: any message's `content` may be a parts list mixing
@@ -657,6 +661,18 @@ class HfMossVlAdapter:
         `<|image|>`/`<|video|>` placeholder order the chat template emits.
         Legacy top-level `req.images`/`req.videos` still attach to the LAST
         user message (prepended as parts) for backward compatibility.
+
+        With `strip_history_media` (Settings.vlm_offline_strip_history_media)
+        only the LAST user turn keeps its real media; every earlier turn's
+        image/video parts become `[图片]`/`[视频]` text markers BEFORE any
+        PIL decode / CAS resolution. The frontend resends the whole
+        conversation on every request, and each historical image would
+        otherwise be decoded and re-encoded by the vision tower every turn —
+        same per-request memory bound as the sglang plane (videos expand to
+        ~20-80k vision tokens each), which also keeps the two offline chat
+        backends behaviorally identical. Long videos OOM'ed even beefy GPUs
+        on multi-turn chats; earlier media is already reflected in the
+        assistant replies.
 
         Blocking (PIL + disk for handles) — call via `asyncio.to_thread`.
         """
@@ -677,12 +693,22 @@ class HfMossVlAdapter:
                 target["content"] = media_parts + [
                     {"type": "text", "text": body if isinstance(body, str) else str(body or "")}]
 
+        # Index of the newest user turn — the only one that keeps its real
+        # media when stripping is enabled (see docstring).
+        last_user_idx = None
+        if strip_history_media:
+            for i in range(len(messages) - 1, -1, -1):
+                if messages[i].get("role") == "user":
+                    last_user_idx = i
+                    break
+
         images: list = []
         videos: list = []
-        for m in messages:
+        for idx, m in enumerate(messages):
             content = m.get("content")
             if not isinstance(content, list):
                 continue
+            media_stripped = (last_user_idx is not None and idx != last_user_idx)
             parts = []
             for part in content:
                 if not isinstance(part, dict):
@@ -690,10 +716,16 @@ class HfMossVlAdapter:
                     continue
                 ptype = part.get("type")
                 if ptype == "image":
+                    if media_stripped:
+                        parts.append({"type": "text", "text": "[图片]"})
+                        continue
                     payload = part.get("media") or part.get("image") or part.get("data") or ""
                     images.append(cls._decode_chat_image(str(payload)))
                     parts.append({"type": "image"})
                 elif ptype == "video":
+                    if media_stripped:
+                        parts.append({"type": "text", "text": "[视频]"})
+                        continue
                     payload = part.get("media") or part.get("video") or ""
                     videos.append(cls._resolve_chat_video(str(payload)))
                     parts.append({"type": "video"})
@@ -734,9 +766,15 @@ class HfMossVlAdapter:
         processor = self.processor
         tokenizer = getattr(processor, "tokenizer", processor)
         params = req.params
+        # Schema temperature is None-able (→ server default). The offline decode
+        # loop samples via params.temperature directly (`or 1.0` would degrade to
+        # temp 1.0) — resolve to Settings here, same contract as realtime.
+        if getattr(params, "temperature", None) is None:
+            params.temperature = self.s.temperature
 
         # media resolution is blocking (PIL + disk for CAS handles) — off-loop
-        messages, images, videos = await asyncio.to_thread(self._prepare_chat_messages, req)
+        messages, images, videos = await asyncio.to_thread(
+            self._prepare_chat_messages, req, self.s.vlm_offline_strip_history_media)
         vision: Optional[dict] = None
         if images or videos:
             template_owner = processor if hasattr(processor, "apply_chat_template") else tokenizer

@@ -32,6 +32,7 @@ import hashlib  # noqa: E402
 from io import BytesIO  # noqa: E402
 import json  # noqa: E402
 import sys  # noqa: E402
+import types  # noqa: E402
 from typing import Any, Dict, List, Optional  # noqa: E402
 
 import uvicorn  # noqa: E402
@@ -199,17 +200,39 @@ async def test_multiturn_media_wire() -> None:
             {"type": "image", "image": jpeg_url},
             {"type": "text", "text": "compare with previous media"}]},
     ]
+
+    # default (Settings.vlm_offline_strip_history_media): only the LAST user
+    # turn rides the wire; earlier media becomes [图片]/[视频] markers so the
+    # per-request vision-token cost stays bounded on long conversations.
     req = ChatRequest(messages=messages)
     before = req.model_dump()
     assert [d async for d in make_pool([PORT]).generate_stream(req)] == expected_deltas()
     body = captured["body"]
-    assert body["image_data"] == [jpeg_url, png_url, jpeg_url]
-    assert len(body["video_data"]) == 1 and os.path.exists(body["video_data"][0])
-    assert body["text"].count("<|image|>") == 3
-    assert body["text"].count("<|video|>") == 1
+    assert body["image_data"] == [png_url, jpeg_url]
+    assert "video_data" not in body  # nothing left to send after stripping
+    assert body["text"].count("<|image|>") == 2
+    assert body["text"].count("<|video|>") == 0
+    assert "[图片]" in body["text"] and "[视频]" in body["text"]
     assert "previous reply" in body["text"] and "compare with previous media" in body["text"]
     assert req.model_dump() == before
-    print("multi-turn media preserved in actual HTTP payload: OK")
+    print("multi-turn history media stripped from HTTP payload: OK")
+
+    # opt-out restores the stock preserve-everything wire
+    os.environ["VLM_OFFLINE_STRIP_HISTORY_MEDIA"] = "0"
+    try:
+        req = ChatRequest(messages=messages)
+        before2 = req.model_dump()
+        assert [d async for d in make_pool([PORT]).generate_stream(req)] == expected_deltas()
+        body = captured["body"]
+        assert body["image_data"] == [jpeg_url, png_url, jpeg_url]
+        assert len(body["video_data"]) == 1 and os.path.exists(body["video_data"][0])
+        assert body["text"].count("<|image|>") == 3
+        assert body["text"].count("<|video|>") == 1
+        assert "previous reply" in body["text"] and "compare with previous media" in body["text"]
+        assert req.model_dump() == before2
+    finally:
+        os.environ.pop("VLM_OFFLINE_STRIP_HISTORY_MEDIA", None)
+    print("multi-turn media preserved with stripping disabled: OK")
 
 
 async def test_media_prep() -> None:
@@ -306,13 +329,30 @@ async def test_chat_routing() -> None:
 def test_sampling_unit() -> None:
     sp = _sampling_params(GenerationParams(
         temperature=0.9, do_sample=True, top_k=5, top_p=0.5,
-        repetition_penalty=1.1, max_new_tokens=64))
+        repetition_penalty=1.1, max_new_tokens=64), 0.7)
     assert sp == {"max_new_tokens": 64, "temperature": 0.9, "top_p": 0.5,
                   "top_k": 5, "repetition_penalty": 1.1,
+                  "frequency_penalty": 0.0, "presence_penalty": 0.0,
                   "stop": ["<|im_end|>"], "skip_special_tokens": True}
     # schema default is now repetition_penalty=None (realtime falls back to
     # GEN_REPETITION_PENALTY) — the sglang mapper must stay None-safe
     assert _sampling_params(GenerationParams())["repetition_penalty"] == 1.0
+    # None-able schema fields (temperature/penalties) resolve to the
+    # server-side defaults (Settings); explicit values still win
+    sp = _sampling_params(GenerationParams(), temperature_default=0.55,
+                          frequency_penalty_default=0.6,
+                          presence_penalty_default=0.2)
+    assert sp["temperature"] == 0.55
+    assert sp["frequency_penalty"] == 0.6 and sp["presence_penalty"] == 0.2
+    # explicit request penalties ride the schema fields and win over defaults
+    sp = _sampling_params(GenerationParams(frequency_penalty=0.3), 0.55, 0.6)
+    assert sp["frequency_penalty"] == 0.3 and sp["presence_penalty"] == 0.0
+    # payload shapes without the attrs at all → server defaults fully apply
+    sp = _sampling_params(types.SimpleNamespace(
+        do_sample=True, top_p=0.8, top_k=20, max_new_tokens=64,
+        repetition_penalty=None), temperature_default=0.55)
+    assert sp["temperature"] == 0.55
+    assert sp["frequency_penalty"] == 0.0 and sp["presence_penalty"] == 0.0
     print("sampling unit: OK")
 
 
