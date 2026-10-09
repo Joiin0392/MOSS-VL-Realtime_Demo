@@ -208,6 +208,7 @@ class HfMossVlAdapter:
         self.model_config = model_config
         log.info("MOSS-VL ready on %s (mode=%s)", device, hf_mode)
 
+    @staticmethod
     def _fix_rope_inv_freq(model: Any) -> None:
         """Repair inv_freq if from_pretrained corrupted it.
 
